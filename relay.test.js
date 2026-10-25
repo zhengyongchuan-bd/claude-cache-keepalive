@@ -2039,3 +2039,56 @@ test('长期保活（--forever）：没有到期时刻，每段空闲不限次�
   assert.equal(g.json.summary.pinned, 1);
   assert.equal(relay.store.sessions.get(SID).pin.untilAt, null);
 });
+
+
+test('按 Paseo 任务 ID 定位：支持 ≥6 位前缀，多个候选时列出不猜；episodes?agent= 也按任务查', async t => {
+  const { clock, relay } = await setup(t, { auto: { mode: 'off' } });
+  const SID2 = '22222222-3333-4444-5555-666666666666';
+  await sendMessages(relay, ['hello'], { sessionId: SID, cwd: '/tmp/ka-a' });
+  await sendMessages(relay, ['hello'], { sessionId: SID2, cwd: '/tmp/ka-b' });
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ka-agents-'));
+  fs.mkdirSync(path.join(agentsDir, 'tmp-ka-a'));
+  fs.mkdirSync(path.join(agentsDir, 'tmp-ka-b'));
+  fs.writeFileSync(path.join(agentsDir, 'tmp-ka-a', '15c60532-aaaa-4000-8000-000000000001.json'), JSON.stringify({ id: '15c60532-aaaa-4000-8000-000000000001', title: '任务甲', cwd: '/tmp/ka-a', persistence: { sessionId: SID } }));
+  fs.writeFileSync(path.join(agentsDir, 'tmp-ka-b', '15c60532-bbbb-4000-8000-000000000002.json'), JSON.stringify({ id: '15c60532-bbbb-4000-8000-000000000002', title: '任务乙', cwd: '/tmp/ka-b', persistence: { sessionId: SID2 } }));
+  const previous = process.env.PASEO_AGENTS_DIR;
+  process.env.PASEO_AGENTS_DIR = agentsDir;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PASEO_AGENTS_DIR;
+    else process.env.PASEO_AGENTS_DIR = previous;
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  });
+  // 前缀歧义
+  const ambiguous = await control(relay, 'POST', 'sessions/pin', { agent: '15c60532' });
+  assert.equal(ambiguous.json.ok, false);
+  assert.match(ambiguous.json.error, /匹配到 2 个任务.*任务甲.*任务乙/);
+  // 唯一前缀 → 定位到对应会话
+  const pinned = await control(relay, 'POST', 'sessions/pin', { agent: '15c60532-bbbb' });
+  assert.equal(pinned.json.ok, true, JSON.stringify(pinned.json));
+  assert.equal(pinned.json.by, 'paseo-agent');
+  assert.equal(pinned.json.results[0].sessionId, SID2);
+  assert.ok(relay.store.sessions.get(SID2).pin);
+  assert.ok(!relay.store.sessions.get(SID).pin);
+  // status / 未知任务 / 太短
+  const status = await control(relay, 'GET', 'sessions?agent=15c60532-aaaa');
+  assert.equal(status.json.sessions[0].id, SID);
+  assert.equal(status.json.sessions[0].paseo.agentId, '15c60532-aaaa-4000-8000-000000000001');
+  const unknown = await control(relay, 'GET', 'sessions?agent=deadbeef');
+  assert.equal(unknown.json.sessions.length, 0);
+  assert.match(unknown.json.hint, /没有找到 Paseo 任务 deadbeef/);
+  const tooShort = await control(relay, 'GET', 'sessions?agent=15c6');
+  assert.match(tooShort.json.hint, /没有找到 Paseo 任务 15c6/);
+  // 执行记录按任务查
+  clock.t += 50 * MIN;
+  relay.tick();
+  await relay.flush();
+  const eps = await control(relay, 'GET', 'episodes?agent=15c60532-bbbb');
+  assert.equal(eps.json.episodes.length, 1);
+  assert.equal(eps.json.episodes[0].sessionId, SID2);
+  assert.equal(eps.json.episodes[0].paseo.title, '任务乙');
+  const epsMiss = await control(relay, 'GET', 'episodes?agent=15c60532');
+  assert.equal(epsMiss.json.ok, false);
+  // unpin / stop 也按任务
+  const un = await control(relay, 'POST', 'sessions/pin', { agent: '15c60532-bbbb', enabled: false });
+  assert.equal(un.json.results[0].changed, true);
+});

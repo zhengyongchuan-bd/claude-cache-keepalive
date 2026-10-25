@@ -80,6 +80,7 @@ cache-keepalive web                     # 页面地址：http://127.0.0.1:18110/
 ## 终端用法
 
 在任务的工作区（或 Paseo 任务内，通过 `PASEO_AGENT_ID` 精确定位）执行时，命令默认作用于「当前任务的会话」。
+在别处操作某个任务，用 `--agent <Paseo 任务 ID 前缀>`（`list` / `status` / 页面会话卡片都显示任务 ID）或 `--session <会话 ID 前缀>`；优先级：`--session` > `--agent` > 任务内 > 当前目录。
 
 ### 日常只需要这几条
 
@@ -136,7 +137,7 @@ cache-keepalive web                     # 页面地址：http://127.0.0.1:18110/
 
 ### 常用选项
 
-`--session ID`（≥6 位前缀）、`--cwd DIR`、`--all`（工作区全部会话）、`--global`、`--all-sessions`（`pin --global` 连缓存已过期的会话也设）、`--ttl 1h|5m|any`、`--for 12h`、`--forever`（长期保活）、`--interval 50m`、`--count N`/`--max`、
+`--session ID`（≥6 位前缀）、`--agent ID`（Paseo 任务 ID，≥6 位前缀，`list` / `status` 里能看到；别名 `--paseo` / `--task`）、`--cwd DIR`、`--all`（工作区全部会话）、`--global`、`--all-sessions`（`pin --global` 连缓存已过期的会话也设）、`--ttl 1h|5m|any`、`--for 12h`、`--forever`（长期保活）、`--interval 50m`、`--count N`/`--max`、
 `--force`、`--reason TEXT`、`--json`、`--relay URL`、`--token TOKEN`（写操作口令，默认读 `~/.local/state/cache-keepalive/control.token`）。
 
 ### 几种「关掉」的区别
@@ -172,6 +173,7 @@ cache-keepalive web                     # 页面地址：http://127.0.0.1:18110/
 cache-keepalive pin                 # 在任务的工作区（或 Paseo 任务内）执行，12 小时
 cache-keepalive pin --for 24h       # 指定时长；--interval 45m 改间隔；--session 3d7c 指定会话
 cache-keepalive unpin               # 取消；stop 也会取消
+cache-keepalive pin --agent 15c60532  # 按 Paseo 任务 ID（前缀）指定；status / stop / unpin / auto on|off / episodes / ping 同样支持 --agent
 cache-keepalive pin --forever       # 长期：没有到期时刻，直到 unpin / stop
 cache-keepalive pin --global        # 所有缓存仍有效的 1h 主对话一起 12 小时；--ttl any 不限 TTL，--all-sessions 连过期的也设
 cache-keepalive pin --global --forever   # 所有正在跑的 1h 会话长期保活

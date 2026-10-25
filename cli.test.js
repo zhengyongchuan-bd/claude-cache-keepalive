@@ -83,6 +83,7 @@ function startMock(t, state) {
       else if (route === 'POST keepalive') payload = state.keepaliveResponse || { ok: true, enabled: body?.enabled !== false, stopped: ['p1', 'p2'], unpinned: [SID_A], persisted: true, autoMode: 'on', disabledSessions: 1, pinnedSessions: 0 };
       else if (route === 'POST sessions/pin') payload = state.pinResponse || { ok: true, enabled: body?.enabled !== false, results: [] };
       else if (route === 'GET summary') payload = { days: 7, totals: {} };
+      else if (route === 'POST ping') payload = state.pingResponse || { ok: true, sessionId: SID_A, by: 'paseo-agent', result: { outcome: 'hit', usage: { cacheRead: 100000, cacheWrite: 0, output: 0 }, costUsd: 0.03 } };
       else if (route === 'GET episodes') payload = state.episodesResponse || { ok: true, days: 7, episodes: [], totals: { episodes: 0, auto: 0, manual: 0, pings: 0, pingCostUsd: 0, pingCostEstimatedUsd: 0, benefitUsd: 0, netUsd: 0, byOutcome: {} } };
       else payload = { ok: false, error: `unexpected ${route}` };
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -579,4 +580,33 @@ test('pin --forever：发 forever 标志，打印长期与按天的上界；--fo
   assert.match(result.stdout, /整天都空闲约 29 次 \$3\.77\/天/);
   const bad = await cli(url, 'pin', '--forever', '--for', '2h');
   assert.notEqual(bad.code, 0);
+});
+
+
+test('--agent：按 Paseo 任务 ID 定位，status / pin / unpin / stop / auto / episodes / ping 都把 agent 传给中继；与 --global 互斥', async t => {
+  const { url, requests } = await startMock(t, {
+    sessions: [{ id: SID_A, cwd: '/tmp/ka-ws', lastSeenAt: Date.now(), paseo: { agentId: '15c60532-aaaa-4000-8000-000000000001', title: '任务甲', status: 'running' }, primary: { ttl: '1h', model: 'claude-opus', contextTokens: 100000, warm: true, remainingSec: 1800, expectedCached: 100000 }, auto: { mode: 'on', state: 'ready' } }],
+  });
+  let result = await cli(url, 'status', '--agent', '15c60532');
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Paseo: 任务甲 · 任务 ID 15c60532/);
+  const sessionsReq = requests.find(item => item.path === '/keepalive/api/sessions');
+  assert.equal(sessionsReq.search.get('agent'), '15c60532');
+  assert.equal(sessionsReq.search.get('cwd'), null);
+  for (const args of [['pin', '--agent', '15c60532'], ['unpin', '--paseo', '15c60532'], ['stop', '--task', '15c60532'], ['auto', 'off', '--agent', '15c60532'], ['ping', '--agent', '15c60532']]) {
+    const before = requests.length;
+    const r = await cli(url, ...args);
+    assert.equal(r.code, 0, `${args.join(' ')}: ${r.stderr}`);
+    const posted = requests.slice(before).find(item => item.method === 'POST');
+    assert.equal(posted.body.agent, '15c60532', args.join(' '));
+    assert.equal(posted.body.cwd, undefined, args.join(' '));
+  }
+  const before = requests.length;
+  result = await cli(url, 'episodes', '--agent', '15c60532');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(requests.slice(before).find(item => item.path === '/keepalive/api/episodes').search.get('agent'), '15c60532');
+  for (const args of [['pin', '--global', '--agent', '15c60532'], ['list', '--agent', '15c60532']]) {
+    const bad = await cli(url, ...args);
+    assert.notEqual(bad.code, 0, args.join(' '));
+  }
 });

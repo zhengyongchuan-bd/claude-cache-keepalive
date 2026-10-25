@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { AUTO_SKIP_LABELS, DEFAULT_CONFIG, OUTCOME_LABELS, UsageTap, buildPingBody, mergeConfig, parseMessagesRequest } from './core.js';
 import { KeepaliveStore } from './store.js';
 import { createAgentLookup } from './agents.js';
-import { findPaseoAgent, lookupPaseoAgents } from './paseo.js';
+import { findPaseoAgentByPrefix, lookupPaseoAgents } from './paseo.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const PUBLIC_DIR = path.join(path.dirname(__filename), 'public');
@@ -410,7 +410,13 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
       case 'GET events':
         return sendJson(res, 200, { events: store.recentEvents(clampNumber(input.limit, 1, 1000, 100)) });
       case 'GET episodes': {
-        const result = store.episodes({ days: clampNumber(input.days, 1, 35, 7), sessionId: input.session ? String(input.session) : null, limit: clampNumber(input.limit, 1, 1000, 200) });
+        let sessionId = input.session ? String(input.session) : null;
+        if (!sessionId && input.agent) {
+          const resolved = resolveTargets({ agent: input.agent, agentCwd: input.agentCwd, cwd: input.cwd });
+          if (!resolved.matches.length) return sendJson(res, 200, { ok: false, error: describeMiss({ agent: input.agent }, resolved), episodes: [], totals: {} });
+          sessionId = resolved.matches[0].id;
+        }
+        const result = store.episodes({ days: clampNumber(input.days, 1, 35, 7), sessionId, limit: clampNumber(input.limit, 1, 1000, 200) });
         // 带上任务标题，页面/CLI 显示更直观
         const titles = new Map(decorate([...new Set(result.episodes.map(e => e.sessionId))].map(id => ({ id, cwd: store.sessions.get(id)?.cwd || null }))).map(view => [view.id, view.paseo]));
         for (const episode of result.episodes) episode.paseo = titles.get(episode.sessionId) || null;
@@ -502,11 +508,14 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
   function resolveTargets(input) {
     if (input.session) return { matches: store.resolveSessions({ sessionId: String(input.session) }), by: 'session' };
     if (input.agent) {
-      const agent = findPaseoAgent(String(input.agent), input.agentCwd || input.cwd);
+      // Paseo 任务 ID（可用 ≥6 位前缀）；多个候选时不猜，列出来让人选
+      const { agent, candidates } = findPaseoAgentByPrefix(String(input.agent), input.agentCwd || input.cwd);
+      if (!agent && candidates.length > 1) return { matches: [], by: 'paseo-agent', ambiguous: candidates };
       const session = agent?.sessionIds.map(id => store.sessions.get(id)).find(Boolean);
-      if (session) return { matches: [session], by: 'paseo-agent' };
+      if (session) return { matches: [session], by: 'paseo-agent', agent };
       // 认得这个任务、但它的会话没经过中继：不要退回按目录匹配到同目录下别的任务
       if (agent) return { matches: [], by: 'paseo-agent', agent };
+      return { matches: [], by: 'paseo-agent', unknownAgent: String(input.agent) };
     }
     if (input.cwd) {
       const current = now();
@@ -527,9 +536,9 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
     let sessions;
     let hint = null;
     if (input.session || input.cwd || input.agent) {
-      const { matches, agent } = resolveTargets(input);
-      sessions = matches.map(session => store.sessionView(session));
-      if (!matches.length) hint = describeMiss(input, agent);
+      const resolved = resolveTargets(input);
+      sessions = resolved.matches.map(session => store.sessionView(session));
+      if (!resolved.matches.length) hint = describeMiss(input, resolved);
     } else {
       sessions = store.listSessions({ sinceMs: hours * 3600 * 1000 });
     }
@@ -540,8 +549,9 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
 
   function startPlans(input) {
     if (truthy(input.global)) return startGlobalPlans(input);
-    const { matches, by, agent } = resolveTargets(input);
-    if (!matches.length) return { ok: false, error: describeMiss(input, agent), results: [] };
+    const resolved = resolveTargets(input);
+    const { matches, by } = resolved;
+    if (!matches.length) return { ok: false, error: describeMiss(input, resolved), results: [] };
     const chosen = truthy(input.all) ? matches : matches.slice(0, 1);
     const results = chosen.map(session => store.startPlan(session, {
       count: planCount(input),
@@ -621,8 +631,9 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
     }
     let sessionIds = null;
     if (!(truthy(input.all) && !input.session && !input.agent && !input.cwd)) {
-      const { matches, agent } = resolveTargets(input);
-      if (!matches.length) return { ok: false, error: describeMiss(input, agent), stopped: [] };
+      const resolved = resolveTargets(input);
+      const { matches } = resolved;
+      if (!matches.length) return { ok: false, error: describeMiss(input, resolved), stopped: [] };
       sessionIds = matches.map(session => session.id);
     }
     const { stopped, autoDisabled, unpinned } = store.stopPlans(sessionIds, input.reason || '手动停止', { source: input.source || 'api' });
@@ -731,8 +742,9 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
       log(`auto global ${enabled ? 'enable' : 'disable'} sessions=${changed.length}`);
       return { ok: true, global: true, enabled, changed, autoMode: cfg.auto.mode, sessions: decorate(all.map(session => store.sessionView(session))) };
     }
-    const { matches, agent } = resolveTargets(input);
-    if (!matches.length) return { ok: false, error: describeMiss(input, agent) };
+    const resolved = resolveTargets(input);
+    const { matches } = resolved;
+    if (!matches.length) return { ok: false, error: describeMiss(input, resolved) };
     const chosen = input.session || input.agent || truthy(input.all) ? matches : matches.slice(0, 1);
     const changed = [];
     for (const session of chosen) {
@@ -746,8 +758,9 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
   // 长保活：给目标会话（工作区 / Paseo 任务 / 指定 ID）设到期时刻；enabled=false 取消。只作用于单个会话或 --all 的工作区会话，不提供全局版本
   function setSessionPin(input) {
     if (truthy(input.global)) return setGlobalPin(input);
-    const { matches, by, agent } = resolveTargets(input);
-    if (!matches.length) return { ok: false, error: describeMiss(input, agent) };
+    const resolved = resolveTargets(input);
+    const { matches, by } = resolved;
+    if (!matches.length) return { ok: false, error: describeMiss(input, resolved) };
     const enabled = input.enabled === undefined ? true : truthy(input.enabled);
     const chosen = input.session || input.agent || truthy(input.all) ? matches : matches.slice(0, 1);
     const results = chosen.map(session => (enabled
@@ -822,8 +835,9 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
   }
 
   async function pingNow(input) {
-    const { matches, by, agent } = resolveTargets(input);
-    if (!matches.length) return { ok: false, error: describeMiss(input, agent) };
+    const resolved = resolveTargets(input);
+    const { matches, by } = resolved;
+    if (!matches.length) return { ok: false, error: describeMiss(input, resolved) };
     const session = matches[0];
     const started = store.pingNow(session, { force: truthy(input.force), source: input.source || 'api-ping' });
     if (!started.ok) return { ...started, by };
@@ -839,8 +853,11 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
     return { ok: result?.outcome === 'hit', by, sessionId: session.id, result, plan: plan && store.planView(plan) };
   }
 
-  function describeMiss(input, agent) {
-    if (agent) return `当前 Paseo 任务（${agent.title || agent.agentId}）的会话没有经过保活中继，无法保活；确认它的模型路由已接入中继`;
+  function describeMiss(input, resolved = {}) {
+    const agent = resolved.agent;
+    if (resolved.ambiguous?.length) return `Paseo 任务 ID 前缀 ${input.agent} 匹配到 ${resolved.ambiguous.length} 个任务：${resolved.ambiguous.slice(0, 6).map(item => `${item.agentId.slice(0, 8)}（${item.title || '无标题'}）`).join('、')}；请多给几位`;
+    if (agent) return `Paseo 任务（${agent.title || agent.agentId}）的会话没有经过保活中继，无法保活；确认它的模型路由已接入中继`;
+    if (resolved.unknownAgent) return `没有找到 Paseo 任务 ${resolved.unknownAgent}（ID 需 ≥6 位前缀；cache-keepalive list 可看每个会话对应的任务 ID）`;
     if (input.session) return `没有找到会话 ${input.session}`;
     if (input.cwd) return `工作区 ${input.cwd} 下没有经过保活中继的会话（需要该会话的请求走中继）`;
     return '需要指定 session、agent 或 cwd';

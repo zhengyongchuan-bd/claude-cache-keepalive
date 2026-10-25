@@ -77,6 +77,36 @@ export function lookupPaseoAgents(cwds) {
   return bySession;
 }
 
+// 按前缀找任务（≥ 6 位）：精确命中优先；多个候选时返回 candidates 让调用方提示
+export function findPaseoAgentByPrefix(prefix, cwdHint) {
+  const text = String(prefix || '').trim();
+  const exact = findPaseoAgent(text, cwdHint);
+  if (exact) return { agent: exact, candidates: [exact] };
+  if (text.length < 6 || !/^[\w-]+$/.test(text)) return { agent: null, candidates: [] };
+  const root = paseoAgentsDir();
+  let dirs;
+  try {
+    dirs = fs.readdirSync(root);
+  } catch {
+    return { agent: null, candidates: [] };
+  }
+  const candidates = [];
+  for (const dir of dirs) {
+    let names;
+    try {
+      names = fs.readdirSync(path.join(root, dir));
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!name.endsWith('.json') || name.startsWith('.') || !name.startsWith(text)) continue;
+      const agent = readAgent(path.join(root, dir, name));
+      if (agent) candidates.push(agent);
+    }
+  }
+  return { agent: candidates.length === 1 ? candidates[0] : null, candidates };
+}
+
 export function findPaseoAgent(agentId, cwdHint) {
   if (!agentId || !/^[\w-]+$/.test(agentId)) return null;
   const root = paseoAgentsDir();

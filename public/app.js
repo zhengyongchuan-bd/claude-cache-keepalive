@@ -538,7 +538,7 @@ function sessionMatches(view) {
   if (state.onlyWarm && !view.primary?.warm) return false;
   if (!state.search) return true;
   const needle = state.search.toLowerCase();
-  return [view.id, view.cwd, view.paseo?.title, view.primary?.model].some(text => text && text.toLowerCase().includes(needle));
+  return [view.id, view.cwd, view.paseo?.title, view.paseo?.agentId, view.primary?.model].some(text => text && text.toLowerCase().includes(needle));
 }
 
 function renderSessions() {
@@ -561,7 +561,7 @@ function sessionRow(view, stats) {
 
   const identity = h('div', {},
     h('div', { class: 's-title', title }, title.length > 80 ? `${title.slice(0, 80)}…` : title),
-    h('div', { class: 's-meta' }, `${shortPath(view.cwd)} · ${shortId(view.id)}`),
+    h('div', { class: 's-meta', title: view.paseo?.agentId ? `Paseo 任务 ID ${view.paseo.agentId}（终端可用 --agent ${shortId(view.paseo.agentId)}）` : undefined }, `${shortPath(view.cwd)} · ${shortId(view.id)}${view.paseo?.agentId ? ` · 任务 ${shortId(view.paseo.agentId)}` : ''}`),
     h('div', { class: 'badges' },
       p ? h('span', { class: 'badge' }, shortModel(p.model)) : null,
       p?.ttl ? h('span', { class: 'badge' }, `TTL ${p.ttl}`) : h('span', { class: 'badge' }, '无缓存断点'),
@@ -836,7 +836,7 @@ function episodeMatches(episode) {
   }
   if (!state.search) return true;
   const needle = state.search.toLowerCase();
-  return [episode.sessionId, episode.cwd, episode.paseo?.title, episode.model].some(text => text && String(text).toLowerCase().includes(needle));
+  return [episode.sessionId, episode.cwd, episode.paseo?.title, episode.paseo?.agentId, episode.model].some(text => text && String(text).toLowerCase().includes(needle));
 }
 
 function amountEl(value, { zero = '—' } = {}) {

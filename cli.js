@@ -59,6 +59,7 @@ const HELP = `用法: cache-keepalive [命令] [选项]      在任务的工作�
 
 常用选项:
   --session ID          指定会话（≥6 位前缀）    --cwd DIR      指定工作区（默认当前目录）
+  --agent ID            指定 Paseo 任务（ID ≥6 位前缀；list / status 会显示；等价于在该任务里执行）
   --all                 作用于工作区全部会话      --global       全局范围
   --for 12h / 2h        时长（pin / start）       --interval 50m 心跳间隔（1h: 5m–55m；5m: 1m–4m30s）
   --count N | --max     手动计划次数              --force        越过软护栏
@@ -70,6 +71,7 @@ const HELP = `用法: cache-keepalive [命令] [选项]      在任务的工作�
   cache-keepalive                      # 看当前任务
   cache-keepalive pin                  # 当前任务长保活 12 小时
   cache-keepalive pin --for 24h --session 3d7c
+  cache-keepalive pin --agent 15c60532          # 按 Paseo 任务 ID 指定；status / stop / unpin / auto / episodes 同样可用 --agent
   cache-keepalive pin --global                  # 所有正在跑的 1h 会话长保活 12 小时
   cache-keepalive pin --forever                 # 当前会话长期保活，直到 unpin
   cache-keepalive stop                 # 当前任务全停
@@ -88,6 +90,7 @@ function parseArgs(argv) {
     };
     if (value === '--session' || value === '-s') opts.session = next();
     else if (value === '--cwd') opts.cwd = path.resolve(next());
+    else if (value === '--agent' || value === '--paseo' || value === '--task') opts.agent = next();
     else if (value === '--all') opts.all = true;
     else if (value === '--all-sessions') opts.allSessions = true;
     else if (value === '--forever' || value === '--always') opts.forever = true;
@@ -175,9 +178,10 @@ function api(opts, method, route, body, timeoutMs = 15000) {
   });
 }
 
-// 「当前任务」：显式 --session > Paseo 任务内运行（PASEO_AGENT_ID）> 当前目录
+// 「当前任务」：显式 --session > 显式 --agent（Paseo 任务 ID）> Paseo 任务内运行（PASEO_AGENT_ID）> 当前目录
 function target(opts) {
   if (opts.session) return { session: opts.session };
+  if (opts.agent) return { agent: String(opts.agent).trim(), ...(opts.cwd ? { agentCwd: opts.cwd } : {}) };
   const out = { cwd: opts.cwd || process.cwd() };
   if (!opts.cwd && process.env.PASEO_AGENT_ID) {
     out.agent = process.env.PASEO_AGENT_ID;
@@ -271,7 +275,7 @@ const planStateText = plan => (plan.state === 'retrying'
 
 function printSession(view, now) {
   const p = view.primary;
-  const title = view.paseo?.title ? `（Paseo: ${view.paseo.title.slice(0, 40)}${view.paseo.title.length > 40 ? '…' : ''}）` : '';
+  const title = view.paseo ? `（Paseo: ${(view.paseo.title || '无标题').slice(0, 40)}${(view.paseo.title || '').length > 40 ? '…' : ''} · 任务 ID ${short(view.paseo.agentId)}）` : '';
   console.log(`● 会话 ${short(view.id)}${title}`);
   console.log(`  工作区 ${view.cwd || '-'}`);
   if (!p) {
@@ -417,7 +421,7 @@ function printSessionList(views, { hours, health, filters, stats }) {
     const p = view.primary;
     const cache = view.busy ? '请求进行中' : p?.warm ? `剩 ${fmtDuration(p.remainingSec)}` : p ? '已过期' : '无缓存';
     console.log(`${short(view.id)}  ${(p?.ttl || '-').padEnd(3)}  ${fmtTokens(p?.contextTokens).padStart(7)}  ${cache.padEnd(8)}  ${clip(planShort(view.plan), 30)}  ${clip(autoShort(view.auto), 28)}`);
-    const title = view.paseo?.title ? `  (${clip(view.paseo.title, 36)})` : '';
+    const title = view.paseo ? `  (Paseo ${short(view.paseo.agentId)} ${clip(view.paseo.title || '', 32)})` : '';
     console.log(`  ${clipPath(view.cwd || '-', 72)}${title}`);
   }
 }
@@ -749,7 +753,7 @@ async function backtestCommand(opts) {
 // ------------------------------------------------------------------ 全局列表
 
 async function listCommand(opts) {
-  if (opts.session || opts.cwd) throw new Error('list 不支持 --session / --cwd；查看单个工作区用 status [--all]');
+  if (opts.session || opts.cwd || opts.agent) throw new Error('list 不支持 --session / --cwd / --agent；查看单个会话或工作区用 status [--all]');
   const hours = opts.hours != null ? Math.round(Number(opts.hours)) : Math.round(Number(opts.days || 1) * 24);
   if (!Number.isFinite(hours) || hours < 1 || hours > 168) throw new Error('--hours 需要是 1–168 的整数（或 --days 1–7）');
   const limit = opts.limit == null ? 0 : Number(opts.limit);
@@ -846,7 +850,7 @@ async function main() {
     if (opts.json) return out(result);
     if (!result.sessions.length) {
       console.log(result.hint || '最近没有经过保活中继的会话。');
-      if (query.cwd || query.agent) console.log(`确认该任务的模型路由已接入中继（ANTHROPIC_BASE_URL 指向 ${relayBase(opts)}），且发过至少一次请求。`);
+      if ((query.cwd || query.agent) && !/匹配到|没有找到 Paseo/.test(result.hint || '')) console.log(`确认该任务的模型路由已接入中继（ANTHROPIC_BASE_URL 指向 ${relayBase(opts)}），且发过至少一次请求。`);
       return undefined;
     }
     // sessions 默认不列没有会话 ID、也没有缓存的旁路请求（--all 显示全部）
@@ -927,7 +931,7 @@ async function main() {
   if (command === 'pin' || command === 'unpin') {
     if (command === 'pin' && opts.count != null) throw new Error('pin 按时长设置，用 --for 12h，不用 --count');
     if (opts.global) {
-      if (opts.session || opts.cwd) throw new Error(`${command} --global 不能和 --session / --cwd 一起使用`);
+      if (opts.session || opts.cwd || opts.agent) throw new Error(`${command} --global 不能和 --session / --cwd / --agent 一起使用`);
       const result = await api(opts, 'POST', 'sessions/pin', { global: true, enabled: command === 'pin', for: opts.for, forever: opts.forever || undefined, interval: opts.interval, ttl: opts.ttl, allSessions: opts.allSessions, reason: opts.reason || null, source: 'cli' }, 60000);
       if (opts.json) return out(result);
       if (result.error) throw new Error(result.error);
@@ -1005,8 +1009,13 @@ async function main() {
   if (command === 'episodes') {
     const params = new URLSearchParams({ days: String(opts.days || 7), limit: String(opts.limit || 50) });
     if (opts.session) params.set('session', opts.session);
+    else if (opts.agent) {
+      params.set('agent', String(opts.agent).trim());
+      if (opts.cwd) params.set('agentCwd', opts.cwd);
+    }
     const result = await api(opts, 'GET', `episodes?${params}`);
     if (opts.json) return out(result);
+    if (result.error) throw new Error(result.error);
     printEpisodes(result);
     return undefined;
   }
