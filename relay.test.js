@@ -1857,3 +1857,44 @@ test('总开关 off：停掉所有计划与长保活、不再自动、不能新�
   assert.equal(relay.store.activePlans().length, 0, '热加载关闭后残留计划取消');
   assert.equal((await control(relay, 'GET', 'health')).json.enabled, false);
 });
+
+
+test('自动保活：没有 Paseo 时按进程探测——会话的 claude 进程退出后这段空闲不保活；进程还在照常', async t => {
+  const { createAgentLookup } = await import('./agents.js');
+  const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ka-proc-'));
+  t.after(() => fs.rmSync(procDir, { recursive: true, force: true }));
+  const addProc = (pid, argv, cwd) => {
+    fs.mkdirSync(path.join(procDir, String(pid)));
+    fs.writeFileSync(path.join(procDir, String(pid), 'cmdline'), `${argv.join('\0')}\0`);
+    fs.symlinkSync(cwd, path.join(procDir, String(pid), 'cwd'));
+  };
+  const clockRef = { t: 0 };
+  const lookup = createAgentLookup({ cfg: { agentProbe: { paseo: false } }, now: () => clockRef.t, procDir });
+  const { clock, relay } = await setup(t, AUTO, { agentLookup: lookup });
+  clockRef.t = clock.t;
+  addProc(4242, ['/opt/node/bin/claude', '--resume', SID], '/tmp/ka-ws');
+  await sendMessages(relay, ['hello']);
+  let view = (await control(relay, 'GET', `sessions?session=${SID}`)).json.sessions[0];
+  assert.equal(view.agent?.status, 'idle');
+  assert.equal(view.agent?.match, 'session-id');
+  // 进程退出后到点：跳过
+  fs.rmSync(path.join(procDir, '4242'), { recursive: true });
+  clock.t += 50 * MIN;
+  clockRef.t = clock.t;
+  relay.tick();
+  await relay.flush();
+  assert.equal(autoPlans(relay).length, 0);
+  assert.equal(relay.store.primaryLineage(relay.store.sessions.get(SID)).autoEpisode.code, 'agent-closed');
+  view = (await control(relay, 'GET', `sessions?session=${SID}`)).json.sessions[0];
+  assert.equal(view.agent?.status, 'closed');
+  // 进程以 --resume 回来并继续工作：下一段空闲照常保活
+  addProc(4300, ['claude', `--resume=${SID}`], '/tmp/ka-ws');
+  clock.t += 5 * MIN;
+  clockRef.t = clock.t;
+  await sendMessages(relay, ['hello', 'ok', 'back']);
+  clock.t += 50 * MIN;
+  clockRef.t = clock.t;
+  relay.tick();
+  await relay.flush();
+  assert.equal(autoPlans(relay).length, 1);
+});

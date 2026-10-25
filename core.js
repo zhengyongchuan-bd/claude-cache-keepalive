@@ -45,6 +45,11 @@ export const DEFAULT_CONFIG = Object.freeze({
   pin: { defaultSec: 12 * 3600, maxSec: 48 * 3600 },
   // 真实请求失败（如 529）后客户端会立刻重试：这段时间会话算活跃，不发心跳
   requestRetryGraceSec: 90,
+  // 会话对应的任务还在不在（自动保活「任务已关闭」门槛）：process = 扫 /proc 里的 Claude Code 进程（按 --resume 会话 ID 或工作区匹配，
+  // 只对见过进程的会话下结论）；paseo = 读 ~/.paseo/agents（有就优先）。两者都可关
+  agentProbe: { process: true, paseo: true },
+  // 回测的会话记录来源：默认 $CLAUDE_CONFIG_DIR / ~/.claude 的 projects，加上 Paseo 路由里标了 1h 的；这里可再加目录（projects 目录或其上级）
+  backtest: { roots: [] },
   prices: {},     // 覆盖默认价格表，USD / 百万 token
   priceScale: 1,  // 网关折扣等整体系数
   // 自动保活：1h 缓存的主对话空闲到间隔时自动发心跳，每段空闲最多 count 次；用户手动 stop 后整个会话不再自动保活
@@ -56,7 +61,7 @@ export const DEFAULT_CONFIG = Object.freeze({
     toolGapIgnoresTurns: true, // 工具（含子代理、后台任务）执行中的空闲一定会有下一次请求，不看人工轮次
     quietHours: [1, 8],       // 本地时间 [1 点, 8 点) 开始的空闲不自动保活（多半是去睡了，3.5 小时也保不住）；[0, 0] 关闭
     missCooldownSec: 7200,    // 任一自动心跳没命中后，全局暂停新的自动保活这么久
-    // Paseo 显示任务已关闭/出错（进程已退出）的空闲不保活：线上 7 天里「保活后没人回来」13 段对「生效」10 段，没回来是最大的成本来源
+    // 任务进程已退出（进程探测 / Paseo 显示已关闭或出错）的空闲不保活：线上 7 天里「保活后没人回来」13 段对「生效」10 段，没回来是最大的成本来源
     skipClosedAgents: true,
   },
 });
@@ -89,6 +94,8 @@ export function mergeConfig(base, override = {}) {
   out.auto = { ...(base.auto || {}), ...(override.auto || {}) };
   out.alerts = { ...(base.alerts || {}), ...(override.alerts || {}) };
   out.pin = { ...(base.pin || {}), ...(override.pin || {}) };
+  out.agentProbe = { ...(base.agentProbe || {}), ...(override.agentProbe || {}) };
+  out.backtest = { ...(base.backtest || {}), ...(override.backtest || {}) };
   return out;
 }
 
@@ -762,7 +769,7 @@ export const AUTO_SKIP_LABELS = Object.freeze({
   'auto-off': '自动保活已全局关闭',
   'session-stopped': '该会话已手动停止保活',
   anonymous: '请求里没有会话 ID',
-  archived: 'Paseo 任务已归档',
+  archived: '任务已归档（Paseo）',
   'not-main-thread': '还没见过该会话主对话的请求',
   'not-1h': '不是 1h 缓存',
   'ttl-downgraded': '请求标了 1h，上游实际按 5m 写入缓存',
@@ -776,7 +783,7 @@ export const AUTO_SKIP_LABELS = Object.freeze({
   'busy-plan': '已有手动保活计划',
   'no-snapshot': '中继里没有该会话的请求快照',
   'missed-window': '中继错过了判定窗口（空闲 50–58 分钟之间没运行）',
-  'agent-closed': 'Paseo 任务已关闭/退出，没人会回来',
+  'agent-closed': '任务进程已退出（或 Paseo 任务已关闭），没人会回来',
   pinned: '该会话设置了长保活，由长保活接管',
 });
 

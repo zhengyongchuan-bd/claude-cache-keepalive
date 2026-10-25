@@ -275,7 +275,7 @@ function autoRuleText(auto) {
   const interval = fmtDuration(auto.intervalSec || 3000);
   return `主对话空闲 ${interval} 还没有新请求就自动发心跳，之后每 ${interval} 一次，每段空闲最多 ${auto.count} 次；`
     + `缓存前缀 ≥ ${fmtTokens(auto.minContextTokens)}、人工接入 ≥ ${auto.minHumanTurns} 轮${auto.toolGapIgnoresTurns !== false ? '（工具/子代理执行中的空闲不看轮次）' : ''}；${quiet}；`
-    + `自动心跳没命中后全局暂停 ${fmtDuration(auto.missCooldownSec)}${auto.skipClosedAgents === false ? '' : '；Paseo 任务已关闭/出错的空闲不保活'}。手动「停止」的会话不再自动保活。`
+    + `自动心跳没命中后全局暂停 ${fmtDuration(auto.missCooldownSec)}${auto.skipClosedAgents === false ? '' : '；任务进程已退出（或 Paseo 任务已关闭）的空闲不保活'}。手动「停止」的会话不再自动保活。`
     + (auto.configExists === false ? ' 配置文件不存在，当前全部为默认值（保存设置会重新创建）。' : '');
 }
 
@@ -545,6 +545,7 @@ function sessionRow(view, stats) {
       p ? h('span', { class: 'badge' }, shortModel(p.model)) : null,
       p?.ttl ? h('span', { class: 'badge' }, `TTL ${p.ttl}`) : h('span', { class: 'badge' }, '无缓存断点'),
       view.paseo?.status ? h('span', { class: 'badge' }, `Paseo ${view.paseo.status}`) : null,
+      view.agent && view.agent.source !== 'paseo' ? h('span', { class: 'badge', title: view.agent.match === 'session-id' ? '按命令行里的会话 ID 匹配到进程' : '按工作区匹配到进程' }, view.agent.status === 'closed' ? '进程已退出' : '进程在') : null,
       h('span', { class: 'badge', title: '主对话里人发的消息数（不含工具结果、系统注入、压缩摘要）' }, `人工 ${view.humanTurns || 0} 轮`),
       view.lineages.length > 1 ? h('span', { class: 'badge', title: '同一会话里的主对话、子代理与旁路请求' }, `${view.lineages.length} 条请求谱系`) : null));
 

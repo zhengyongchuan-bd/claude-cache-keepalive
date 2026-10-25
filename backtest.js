@@ -28,21 +28,48 @@ const __filename = fileURLToPath(import.meta.url);
 const DAY_MS = 86400 * 1000;
 export const ROUTER_ROOT = path.join(os.homedir(), '.cache', 'paseo', 'claude-router');
 
-// 1h 路由：settings.json 里 promptCacheTtl = 1h 的路由目录
-export function discoverRoots(root = ROUTER_ROOT) {
+// Claude Code 自己的配置目录：$CLAUDE_CONFIG_DIR 或 ~/.claude（会话记录在其 projects/ 下）
+export function defaultClaudeDirs() {
+  const dirs = [];
+  if (process.env.CLAUDE_CONFIG_DIR) dirs.push(process.env.CLAUDE_CONFIG_DIR);
+  dirs.push(path.join(os.homedir(), '.claude'));
+  return dirs;
+}
+
+// 会话记录来源：Claude Code 配置目录的 projects（每次请求的 usage 自带 5m/1h 拆分，不用按 TTL 过滤）、
+// Paseo 路由里 settings.json 标了 promptCacheTtl=1h 的、以及配置里额外指定的目录（projects 目录或它的上级）
+export function discoverRoots(root = ROUTER_ROOT, { claudeDirs = defaultClaudeDirs(), extra = [] } = {}) {
   const out = [];
+  const seen = new Set();
+  const add = (route, dir) => {
+    let real = dir;
+    try {
+      real = fs.realpathSync(dir);
+    } catch {
+      return;
+    }
+    if (seen.has(real) || !fs.statSync(real).isDirectory()) return;
+    seen.add(real);
+    out.push({ route, dir: real });
+  };
+  for (const dir of claudeDirs) {
+    if (!dir) continue;
+    add(path.basename(dir) || 'claude', path.join(dir, 'projects'));
+  }
   let names = [];
   try {
     names = fs.readdirSync(root);
-  } catch {
-    return out;
-  }
+  } catch { /* 没有 Paseo 路由目录 */ }
   for (const name of names.sort()) {
     try {
       const settings = JSON.parse(fs.readFileSync(path.join(root, name, 'settings.json'), 'utf8'));
-      const projects = path.join(root, name, 'projects');
-      if (settings.promptCacheTtl === '1h' && fs.existsSync(projects)) out.push({ route: name, dir: projects });
+      if (settings.promptCacheTtl === '1h') add(name, path.join(root, name, 'projects'));
     } catch { /* 不是路由目录 */ }
+  }
+  for (const dir of extra || []) {
+    if (!dir) continue;
+    const expanded = String(dir).replace(/^~(?=\/|$)/, os.homedir());
+    add(path.basename(expanded), fs.existsSync(path.join(expanded, 'projects')) ? path.join(expanded, 'projects') : expanded);
   }
   return out;
 }
@@ -134,10 +161,11 @@ export async function readTranscript(file) {
   };
 }
 
-export async function loadSessions({ roots = discoverRoots() } = {}) {
+export async function loadSessions({ roots = null, cfg = null } = {}) {
+  const list = roots || discoverRoots(ROUTER_ROOT, { extra: cfg?.backtest?.roots });
   const bySid = new Map();
   const seen = new Set();
-  for (const { route, dir } of roots) {
+  for (const { route, dir } of list) {
     for (const file of listTranscripts(dir)) {
       let real = file;
       try {
@@ -325,7 +353,7 @@ export function summarize(sessions, simulated) {
 
 export async function runBacktest({ cfg = DEFAULT_CONFIG, days = 7, now = Date.now(), roots, sessions = null, variants = null } = {}) {
   const since = now - days * DAY_MS;
-  const loaded = sessions || await loadSessions({ roots });
+  const loaded = sessions || await loadSessions({ roots, cfg });
   const run = variantCfg => {
     const simulated = loaded.map(session => simulateSession(session, { cfg: variantCfg, now, since }));
     return { simulated, ...summarize(loaded, simulated) };

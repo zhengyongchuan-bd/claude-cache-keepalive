@@ -443,7 +443,7 @@ test('stats 显示超时次数、预估成本，以及自动策略 / 手动上�
   assert.match(result.stdout, /含预估 \$0\.200/);
   assert.match(result.stdout, /按当前自动策略能救回 \$1\.50，手动用满次数上限能救回 \$6\.00/);
   assert.match(result.stdout, /中继错过了判定窗口.* 1/);
-  assert.match(result.stdout, /Paseo 任务已关闭\/退出.* 2/);
+  assert.match(result.stdout, /任务进程已退出.* 2/);
   assert.ok(url);
 });
 
@@ -458,7 +458,7 @@ test('auto set --skip-closed on|off 传 skipClosedAgents；auto 显示配置文�
   result = await cli(url, 'auto');
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /配置文件 \/tmp\/config.json（不存在：当前全部为默认值/);
-  assert.match(result.stdout, /Paseo 任务已关闭的空闲照常保活/);
+  assert.match(result.stdout, /任务进程已退出的空闲照常保活/);
 });
 
 

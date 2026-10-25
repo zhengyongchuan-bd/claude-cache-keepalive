@@ -85,7 +85,7 @@ test('readTranscript / loadSessions：只读主对话（跳过子代理目录与
     'not json',
   ].join('\n'));
   fs.writeFileSync(path.join(projects, 'sid1', 'subagents', 'agent-x.jsonl'), line({ type: 'assistant', timestamp: '2026-10-21T02:00:09Z', message: { id: 'sub', model: 'claude-haiku-5-5', usage } }));
-  const roots = discoverRoots(root);
+  const roots = discoverRoots(root, { claudeDirs: [] });
   assert.deepEqual(roots.map(r => r.route), ['local-opus-5-5-1h'], '只扫 1h 路由');
   const one = await readTranscript(path.join(projects, 'sid1.jsonl'));
   assert.equal(one.calls.length, 1);

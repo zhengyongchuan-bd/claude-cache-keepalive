@@ -16,6 +16,7 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { AUTO_SKIP_LABELS, DEFAULT_CONFIG, OUTCOME_LABELS, UsageTap, buildPingBody, mergeConfig, parseMessagesRequest } from './core.js';
 import { KeepaliveStore } from './store.js';
+import { createAgentLookup } from './agents.js';
 import { findPaseoAgent, lookupPaseoAgents } from './paseo.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -32,7 +33,6 @@ const PING_BLOCKED = {
   'waiting-auth': '中继重启后还没见过凭证，等任一请求经过中继',
 };
 const TICK_MS = 5000;
-const AGENT_CACHE_MS = 30000;
 const BACKTEST_CACHE_MS = 10 * 60 * 1000;
 // 重启时等在途的流式响应结束的上限；之后最多再等 FLUSH_MS 让在途心跳记完账；systemd 单元的 TimeoutStopSec 要比两者之和长
 const DRAIN_MS = 120000;
@@ -65,23 +65,12 @@ export function loadConfig(overrides = {}) {
 }
 
 // watchConfig = { file, load }：配置文件变化时热加载（端口/上游除外），不必重启丢内存快照；页面改自动保活设置也写这个文件。
-// agentLookup(session) → { status, archived } | null：会话对应的 Paseo 任务（默认按会话工作区查 ~/.paseo/agents，测试可替换）
+// agentLookup(session) → { status, archived } | null：会话对应的任务还在不在（默认 agents.js：进程探测 + 可选 Paseo；测试可替换）
 export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log = defaultLog, watchConfig = null, agentLookup = null, backtestRunner = null } = {}) {
   const target = new URL(cfg.upstream);
   if (!['http:', 'https:'].includes(target.protocol)) throw new Error(`不支持的上游协议: ${target.protocol}`);
   const transport = target.protocol === 'https:' ? https : http;
-  const agentCacheBySession = new Map();
-  const lookupAgent = agentLookup || (session => {
-    if (!session.cwd) return null;
-    const cached = agentCacheBySession.get(session.id);
-    if (cached && now() - cached.at < AGENT_CACHE_MS) return cached.agent;
-    let agent = null;
-    try {
-      agent = lookupPaseoAgents([session.cwd]).get(session.id) || null;
-    } catch { /* 读不到 Paseo 数据就当没有 */ }
-    agentCacheBySession.set(session.id, { at: now(), agent });
-    return agent;
-  });
+  const lookupAgent = agentLookup || createAgentLookup({ cfg, now, log });
   const stats = { requests: 0, messages: 0, captured: 0, upstreamErrors: 0, pings: 0, configReloads: 0, drainRejected: 0, tickErrors: 0, alertsSent: 0, alertsFailed: 0, tokenRejected: 0, rejectedTooLarge: 0 };
   const notifier = createNotifier({ cfg, now, log, stats, transportFor: url => (url.protocol === 'https:' ? https : http) });
   const notify = alert => notifier.send(alert);
@@ -502,6 +491,10 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
     for (const view of views) {
       const agent = agents.get(view.id);
       view.paseo = agent ? { agentId: agent.agentId, title: agent.title, status: agent.status, model: agent.model } : null;
+      // 没有 Paseo 时也给页面/CLI 一个「进程还在不在」的信号
+      const session = store.sessions.get(view.id);
+      const probe = session ? lookupAgent(session) : null;
+      view.agent = probe ? { status: probe.status, archived: Boolean(probe.archived), source: probe.source, match: probe.match || null } : null;
     }
     return views;
   }

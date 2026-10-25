@@ -272,7 +272,7 @@ function printSession(view, now) {
     return;
   }
   const state = view.busy ? '请求进行中' : p.warm ? `缓存剩余 ${fmtDuration(p.remainingSec)}（${fmtTime(p.expiresAt)} 过期）` : `缓存已过期（${fmtTime(p.expiresAt)}）`;
-  console.log(`  模型 ${p.model} · TTL ${p.ttl || '无缓存'} · 缓存前缀 ${fmtTokens(p.contextTokens)} tokens`);
+  console.log(`  模型 ${p.model} · TTL ${p.ttl || '无缓存'} · 缓存前缀 ${fmtTokens(p.contextTokens)} tokens${view.agent ? ` · 进程${view.agent.status === 'closed' ? '已退出' : '在'}（${view.agent.source === 'paseo' ? 'Paseo' : view.agent.match === 'session-id' ? '按会话 ID 匹配' : '按工作区匹配'}）` : ''}`);
   console.log(`  最近触达 ${fmtTime(p.lastTouchAt)}（${ago(p.lastTouchAt, now)}）→ ${state}`);
   if (p.lastPing) {
     const u = p.lastPing.usage;
@@ -607,7 +607,7 @@ function printAutoSettings(auto) {
   const quiet = auto.quietHours?.[0] === auto.quietHours?.[1] ? '不设' : `${auto.quietHours[0]}–${auto.quietHours[1]} 点开始的空闲不保活`;
   console.log(`自动保活（全局）：${auto.mode === 'on' ? '开' : '关'}`);
   console.log(`  主对话空闲 50m 自动心跳，每段空闲最多 ${auto.count} 次；缓存前缀 ≥ ${fmtTokens(auto.minContextTokens)}；人工接入 ≥ ${auto.minHumanTurns} 轮${auto.toolGapIgnoresTurns !== false ? '（工具执行中的空闲不看）' : ''}`);
-  console.log(`  凌晨时段：${quiet}；心跳没命中后全局暂停 ${fmtDuration(auto.missCooldownSec)}${auto.cooldownUntil ? `（暂停中，到 ${fmtTime(auto.cooldownUntil)}）` : ''}；Paseo 任务已关闭的空闲${auto.skipClosedAgents === false ? '照常保活' : '不保活'}`);
+  console.log(`  凌晨时段：${quiet}；心跳没命中后全局暂停 ${fmtDuration(auto.missCooldownSec)}${auto.cooldownUntil ? `（暂停中，到 ${fmtTime(auto.cooldownUntil)}）` : ''}；任务进程已退出的空闲${auto.skipClosedAgents === false ? '照常保活' : '不保活'}`);
   if (auto.disabledSessions) console.log(`  会话级关闭：${auto.disabledSessions} 个会话不再自动保活（cache-keepalive auto reset --global 恢复）`);
   if (auto.configFile) console.log(`  配置文件 ${auto.configFile}${auto.configExists === false ? '（不存在：当前全部为默认值，auto set / 页面保存会重新创建）' : ''}`);
 }
