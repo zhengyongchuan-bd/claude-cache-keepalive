@@ -576,6 +576,7 @@ test('pin --forever：发 forever 标志，打印长期与按天的上界；--fo
   const body = requests.find(item => item.path === '/keepalive/api/sessions/pin').body;
   assert.equal(body.forever, true);
   assert.match(result.stdout, /长期保活（没有到期时刻，直到 cache-keepalive unpin \/ stop）/);
+  assert.match(result.stdout, /整天都空闲约 29 次 \$3\.77\/天/);
   const bad = await cli(url, 'pin', '--forever', '--for', '2h');
   assert.notEqual(bad.code, 0);
 });

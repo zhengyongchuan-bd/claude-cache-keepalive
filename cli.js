@@ -965,7 +965,7 @@ async function main() {
       const e = item.estimate;
       if (pin.untilAt == null) console.log(`✓ 会话 ${short(item.sessionId)} 长期保活（没有到期时刻，直到 cache-keepalive unpin / stop）：每 ${fmtInterval(pin.intervalSec)} 一次，只在空闲时发；人在工作时不发，会话继续后下一段空闲接着保；未命中、任务进程退出、每日额度照常`);
       else console.log(`✓ 会话 ${short(item.sessionId)} 长保活到 ${fmtDateTime(pin.untilAt)}（${fmtDuration(pin.durationSec)}，每 ${fmtInterval(pin.intervalSec)} 一次，只在空闲时发；人在工作时不发，会话继续后下一段空闲接着保）`);
-      if (e) console.log(`  缓存前缀 ${fmtTokens(e.contextTokens)} tokens；每次心跳约 ${fmtUsd(e.pingUsd)}，整段都空闲时最多 ${e.maxPings} 次 ${fmtUsd(e.maxUsd)}；保住后回来约省 ${fmtUsd(e.saveUsd)}`);
+      if (e) console.log(`  缓存前缀 ${fmtTokens(e.contextTokens)} tokens；每次心跳约 ${fmtUsd(e.pingUsd)}，${e.maxPings == null ? `整天都空闲约 ${e.perDayPings} 次 ${fmtUsd(e.perDayUsd)}/天` : `整段都空闲时最多 ${e.maxPings} 次 ${fmtUsd(e.maxUsd)}`}；保住后回来约省 ${fmtUsd(e.saveUsd)}`);
       if (item.plan) console.log(`  本段空闲已到点：计划 ${item.plan.count} 次，首次心跳 ${fmtTime(item.plan.nextPingAt)}`);
       for (const warning of item.warnings || []) console.log(`  ! ${warning}`);
     }
