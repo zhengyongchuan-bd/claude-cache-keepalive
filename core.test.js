@@ -78,6 +78,8 @@ test('extractSessionId：请求头优先，其次 metadata.user_id 两种格式'
 
 test('extractCwd 识别 SDK 与 CLI 两种环境段', () => {
   assert.equal(extractCwd({ system: [{ type: 'text', text: '# Environment\n - Primary working directory: /home/u/project\n - Is a git repository: true' }] }), '/home/u/project');
+  // 会话中途 cd：环境段写成「新目录 (was 旧目录)」，只取当前目录
+  assert.equal(extractCwd({ system: [{ type: 'text', text: '# Environment update\n - Primary working directory: /home/u/project/sub (was /home/u/project)\n' }] }), '/home/u/project/sub');
   assert.equal(extractCwd({ system: '<env>\nWorking directory: /tmp/ws\nIs directory a git repo: No\n</env>' }), '/tmp/ws');
   assert.equal(extractCwd({ system: [], messages: [{ role: 'user', content: [{ type: 'text', text: 'Working directory: /x/y' }] }] }), '/x/y');
   assert.equal(extractCwd({ system: 'nothing' }), null);

@@ -274,10 +274,15 @@ function blockTexts(content) {
   return arr(content).filter(block => isPlainObject(block) && typeof block.text === 'string').map(block => block.text);
 }
 
+// 会话中途 cd 后，环境段会写成「/new/dir (was /old/dir)」；只要当前目录，否则 Paseo 任务映射与按目录匹配都会失效
+function cleanCwd(text) {
+  return String(text).trim().replace(/\s*\((?:was|previously|formerly)\b[^)]*\)\s*$/i, '').trim();
+}
+
 function cwdFromTexts(texts) {
   for (const text of texts) {
     const match = text.match(CWD_RE);
-    if (match) return match[1].trim();
+    if (match) return cleanCwd(match[1]);
   }
   return null;
 }
