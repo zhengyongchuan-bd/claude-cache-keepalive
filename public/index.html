@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Prompt 缓存保活</title>
+    <link rel="icon" href="data:," />
+    <meta name="cache-keepalive-token" content="">
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="ka">
+    <div class="wrap">
+      <header class="top">
+        <div>
+          <h1>Prompt 缓存保活</h1>
+          <p class="sub" id="relay-line">正在连接保活中继…</p>
+        </div>
+        <div class="pills" id="pills"></div>
+      </header>
+
+      <div class="filters" role="group" aria-label="筛选">
+        <div class="seg" id="range" role="radiogroup" aria-label="统计时间范围">
+          <button type="button" data-days="1" role="radio" aria-checked="false">今天</button>
+          <button type="button" data-days="7" role="radio" aria-checked="true">近 7 天</button>
+          <button type="button" data-days="30" role="radio" aria-checked="false">近 30 天</button>
+        </div>
+        <input id="search" type="search" placeholder="搜索任务 / 工作区 / 会话 ID" aria-label="搜索会话" />
+        <label class="check"><input type="checkbox" id="only-warm" /> 只看缓存仍有效</label>
+        <span class="muted small" id="updated"></span>
+      </div>
+
+      <div class="banner" id="banner" hidden></div>
+
+      <section class="kpis" id="kpis" aria-label="成本与收益"></section>
+
+      <section class="card" id="auto-card">
+        <div class="card-head">
+          <h2>自动保活</h2>
+          <span class="muted small" id="auto-summary"></span>
+        </div>
+        <div id="auto"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>会话</h2>
+          <span class="muted small" id="session-count"></span>
+        </div>
+        <div id="sessions"></div>
+      </section>
+
+      <section class="card" id="episodes-card">
+        <div class="card-head">
+          <h2>保活执行记录</h2>
+          <span class="muted small" id="episodes-summary">每一段保活：发了几次心跳、每次是否命中、花了多少、最后人回来时有没有保住</span>
+          <label class="check small"><input type="checkbox" id="episodes-all" /> 包含进行中 / 没回来的</label>
+        </div>
+        <div id="episodes"></div>
+      </section>
+
+      <section class="card" id="chart-card">
+        <div class="card-head">
+          <h2>每日：心跳成本 vs 保活节省</h2>
+          <div class="legend" id="legend" aria-hidden="true"></div>
+          <button type="button" class="ghost" id="chart-toggle" aria-pressed="false">表格</button>
+        </div>
+        <div id="chart" class="chart"></div>
+      </section>
+
+      <section class="card" id="backtest-card">
+        <div class="card-head">
+          <h2>回测：如果一直开着自动保活</h2>
+          <span class="muted small">用本机 1h 路由的会话记录重放，决策与线上同一套规则；只读记录，不发请求</span>
+          <button type="button" class="ghost" id="backtest-run">运行回测</button>
+        </div>
+        <div id="backtest"></div>
+      </section>
+
+      <div class="grid2">
+        <section class="card">
+          <div class="card-head"><h2>最近事件</h2></div>
+          <div id="events"></div>
+        </section>
+        <section class="card">
+          <div class="card-head">
+            <h2>未保活的冷启动重写</h2>
+            <span class="muted small">主对话距上次请求超过 TTL、旧前缀整段重写的请求；按默认间隔估算当时保活能省多少，并注明自动保活当时为什么没开</span>
+          </div>
+          <div id="opportunities"></div>
+        </section>
+      </div>
+
+      <details class="card notes">
+        <summary>口径与护栏</summary>
+        <ul>
+          <li><b>心跳</b>：重放该会话最近一次请求，只把 <code>max_tokens</code> 改成 0、<code>stream</code> 改成 false。上游只做 prefill，刷新缓存 TTL，只按缓存读取计费（Opus 5.5 为 $0.20/M），不产生输出 token。请求头原样重放，网关按 <code>x-claude-code-session-id</code> 落到同一个上游账号。</li>
+          <li><b>保活节省</b>：心跳之后第一次真实请求（「回来」）如果命中了保住的前缀，就把本该发生的整段重写（1h 缓存按输入价 2×，5m 按 1.25×）与实际读取的差价记为收益。只有「回来时距上次真实请求已超过 TTL，且最后一次命中心跳仍在 TTL 内」才计入；TTL 内就回来时，心跳算多余成本。</li>
+          <li><b>执行记录</b>：一段 = 一个保活计划。每次心跳标出命中（✓）、未命中（✗）、部分命中（◐）、超时（⏱）、失败（!）；结局分「保活生效」「TTL 内就回来、心跳多余」「心跳停止后才回来」「保活后没人回来」「缓存保住中」。超时的心跳上游多半已处理并计费，成本按读一遍前缀预估并标「估」，也计入每日额度。</li>
+          <li><b>待兑现</b>：缓存正被心跳保住、用户还没回来；按时回来可省的金额，尚未计入收益。</li>
+          <li><b>自动保活</b>：1h 缓存的主对话空闲 50 分钟还没有新请求，就自动发一次心跳，之后每 50 分钟一次，每段空闲最多 N 次（默认 3 次，约覆盖 3.5 小时的离开）；会话一有新请求，这段空闲的自动保活就结束，下一段空闲重新判定。门槛：缓存前缀够大、有人工接入（工具或子代理执行中的空闲不看人工轮次）、凌晨时段开始的空闲不保活。子代理、旁路请求、5m 缓存都不参与。</li>
+          <li><b>长保活</b>：给某个会话设一个到期时刻（默认 12 小时，最长 48 小时），期间每段空闲都按间隔心跳直到人回来或到期，会话继续后下一段空闲接着保；不受自动保活的门槛与每段次数限制。硬护栏照常：会话活跃时不发、空闲已超过缓存安全窗口的那段不发（等下一次请求后接上）、未命中即锁定并取消、心跳有输出即取消、每日额度、Paseo 归档即取消；「停止」也会取消长保活。</li>
+          <li><b>总开关</b>：「全部关闭」停掉所有会话的自动 / 手动 / 长保活并禁止新开（写入配置，中继重启后仍关），中继照常转发请求；「全部打开」恢复。关闭时取消的长保活不会自动恢复。</li>
+          <li><b>停止</b>：在页面或命令行点「停止」会停掉进行中的计划，并<b>关闭该会话的自动保活</b>（整个会话不再继续保活）；「恢复自动」才会重新打开。全局开关在「自动保活」卡片里。</li>
+          <li><b>冷启动重写</b>：主对话距上次请求超过 TTL、旧前缀里有一大段没读到被迫重写；按默认间隔估算需要几次心跳、当时保活能省多少，并记下自动保活当时的判定。「可挽救」分两列：按当前自动策略的每段次数能救回的，和手动用满次数上限能救回的。</li>
+          <li><b>门槛新增</b>：Paseo 显示任务已关闭/出错的空闲不自动保活（没人会回来）；中继错过了空闲 50–58 分钟的判定窗口时如实标「错过判定窗口」，不再显示「已就绪」。</li>
+          <li><b>写操作口令</b>：页面与 CLI 的开启/停止/心跳/改设置都要带 <code>x-cache-keepalive-token</code>（<code>~/.local/state/cache-keepalive/control.token</code>），同机其他用户或拿不到该文件的进程不能触发计费心跳。可在 <code>config.json</code> 设 <code>"controlToken": false</code> 关闭；<code>alerts.webhookUrl</code> 配置后，未命中锁定、全局冷却、心跳超时、等凭证、额度用尽、上游持续失败、调度异常会推送告警。</li>
+          <li><b>回测</b>：用本机 1h 路由的会话记录，按线上同一个判定函数重放每段空闲；心跳按全部命中计，回来时是否省钱看真实记录里那次请求有没有整段重写；离开 50–60 分钟就回来、或者心跳停了之后才回来的，心跳算白发。</li>
+          <li><b>护栏</b>：心跳没命中（只读到共享前缀、大量重写）会锁定该会话，自动心跳没命中还会全局暂停新的自动保活；部分命中或写入超限立即停止计划；心跳有输出（上游没遵守 <code>max_tokens</code>）立即停发；请求标了 1h 但上游按 5m 写入时不保活；距上次触达超过 TTL−安全边际不再发心跳（会变成整段重写）；会话请求进行中时暂缓；每日上限按预估花费预留（默认 200 次 / $10）。</li>
+          <li><b>价格</b>：Anthropic 官方价目。网关有折扣或特殊计价时，在 <code>~/.config/cache-keepalive/config.json</code> 里设置 <code>priceScale</code> 或 <code>prices</code>。</li>
+        </ul>
+      </details>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

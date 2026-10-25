@@ -1,0 +1,10 @@
+node_modules/
+*.log
+*.tmp
+.DS_Store
+# 本机运行状态与凭证口令永远不进仓库
+state/
+config.json
+control.token
+ledger.jsonl
+snapshots/

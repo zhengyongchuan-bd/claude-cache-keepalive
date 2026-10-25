@@ -1,0 +1,17 @@
+{
+  "name": "claude-cache-keepalive",
+  "version": "1.0.0",
+  "description": "Claude Code 与 Anthropic 兼容网关之间的 Prompt 缓存保活中继：空闲时用 max_tokens:0 心跳刷新 1h 缓存 TTL，按真实 usage 核算成本与收益",
+  "type": "module",
+  "bin": { "cache-keepalive": "./cli.js" },
+  "main": "./relay.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test *.test.js",
+    "serve": "node relay.js",
+    "bench": "node bench.mjs 30"
+  },
+  "files": ["*.js", "bench.mjs", "public/", "README.md", "DEVELOPMENT-EXPERIENCE.md", "ACCEPTANCE-2026-10-23.md"],
+  "keywords": ["claude", "claude-code", "anthropic", "prompt-caching", "keepalive", "relay", "proxy"],
+  "license": "MIT"
+}
