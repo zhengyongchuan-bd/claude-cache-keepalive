@@ -486,7 +486,7 @@ test('pin / unpin：按工作区目标发 sessions/pin，默认不传时长由�
   assert.equal(body2.for, '24h');
   assert.equal(body2.interval, '45m');
   assert.equal(body2.session, SID_A.slice(0, 8));
-  for (const args of [['pin', '--global'], ['pin', '--count', '3'], ['unpin', '--global']]) {
+  for (const args of [['pin', '--count', '3'], ['pin', '--global', '--session', 'abcdef'], ['unpin', '--global', '--cwd', '/x']]) {
     const bad = await cli(url, ...args);
     assert.notEqual(bad.code, 0, args.join(' '));
   }
@@ -534,4 +534,34 @@ test('list 在总开关关闭时打横幅；help 按场景分组', async t => {
   const help = await cli(url, 'help');
   assert.match(help.stdout, /日常只需要这几条/);
   for (const name of ['pin', 'unpin', 'off \/ on', 'episodes', 'stop --global', 'auto set']) assert.match(help.stdout, new RegExp(name), name);
+});
+
+
+test('pin --global / unpin --global：打印新设、延长、跳过与每个会话的估算', async t => {
+  const now = Date.now();
+  const { url, requests } = await startMock(t, {
+    pinResponse: {
+      ok: true, global: true, enabled: true, ttl: '1h',
+      summary: { sessions: 5, pinned: 2, extended: 1, unpinned: 0, skipped: 1, filtered: 1 }, skippedBy: { blocked: 1 },
+      results: [
+        { ok: true, sessionId: SID_A, pin: { untilAt: now + 12 * 3600e3, durationSec: 43200, intervalSec: 3000 }, estimate: { maxPings: 15, pingUsd: 0.12, maxUsd: 1.8, saveUsd: 4.7, contextTokens: 600000 } },
+        { ok: false, sessionId: SID_B, errors: [{ code: 'blocked', message: '上次心跳没命中已锁定' }] },
+      ],
+    },
+  });
+  let result = await cli(url, 'pin', '--global', '--for', '12h');
+  assert.equal(result.code, 0, result.stderr);
+  const body = requests.find(item => item.path === '/keepalive/api/sessions/pin').body;
+  assert.equal(body.global, true);
+  assert.equal(body.enabled, true);
+  assert.equal(body.for, '12h');
+  assert.match(result.stdout, /全局长保活（1h）：新设 2 个，延长 1 个，跳过 1 个（.*1）/);
+  assert.match(result.stdout, /另有 1 个会话不在范围/);
+  assert.match(result.stdout, /aaaaaaaa 到 .*前缀 600\.0K，每次约 \$0\.120，整段空闲最多 15 次 \$1\.80，保住回来省 \$4\.70/);
+  assert.match(result.stdout, /✗ bbbbbbbb 上次心跳没命中已锁定/);
+  const { url: url2, requests: r2 } = await startMock(t, { pinResponse: { ok: true, global: true, enabled: false, summary: { unpinned: 3 }, results: [] } });
+  result = await cli(url2, 'unpin', '--global');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(r2.find(item => item.path === '/keepalive/api/sessions/pin').body.enabled, false);
+  assert.match(result.stdout, /已取消 3 个会话的长保活/);
 });

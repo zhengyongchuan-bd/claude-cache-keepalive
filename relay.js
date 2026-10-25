@@ -745,7 +745,7 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
 
   // 长保活：给目标会话（工作区 / Paseo 任务 / 指定 ID）设到期时刻；enabled=false 取消。只作用于单个会话或 --all 的工作区会话，不提供全局版本
   function setSessionPin(input) {
-    if (truthy(input.global)) return { ok: false, error: '长保活只针对具体会话（工作区 / --session），不提供 --global；全局批量用 start --global --for' };
+    if (truthy(input.global)) return setGlobalPin(input);
     const { matches, by, agent } = resolveTargets(input);
     if (!matches.length) return { ok: false, error: describeMiss(input, agent) };
     const enabled = input.enabled === undefined ? true : truthy(input.enabled);
@@ -765,6 +765,46 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
       sessions: decorate(chosen.map(session => store.sessionView(session))),
       alternatives: input.session || input.agent || truthy(input.all) ? [] : decorate(matches.slice(1, 6).map(session => store.sessionView(session))),
     };
+  }
+
+  // 全局长保活（pin --global / unpin --global）：默认作用于缓存仍有效的 1h 主对话（--ttl 5m / any 放宽；--all-sessions 连缓存已过期的也设，
+  // 等它们下一次请求后接上）。已有长保活的只延长到新的到期时刻。
+  function setGlobalPin(input) {
+    if (input.session || input.agent || input.cwd) return { ok: false, error: '--global 不能和 --session / --cwd 一起使用' };
+    const enabled = input.enabled === undefined ? true : truthy(input.enabled);
+    const ttl = input.ttl === undefined || input.ttl === null || input.ttl === '' ? '1h' : String(input.ttl);
+    if (!['1h', '5m', 'any'].includes(ttl)) return { ok: false, error: 'ttl 只能是 1h / 5m / any' };
+    const current = now();
+    const results = [];
+    const summary = { sessions: store.sessions.size, pinned: 0, extended: 0, unpinned: 0, skipped: 0, filtered: 0 };
+    const skippedBy = {};
+    for (const session of store.sessions.values()) {
+      if (!enabled) {
+        if (!session.pin) continue;
+        const result = store.unpinSession(session, { source: input.source || 'api', reason: input.reason || '全局取消长保活' });
+        summary.unpinned += 1;
+        results.push(result);
+        continue;
+      }
+      const lineage = store.primaryLineage(session);
+      const view = store.lineageView(lineage, current);
+      if (!lineage || !lineage.ttl || !lineage.isMainThread || (ttl !== 'any' && lineage.ttl !== ttl) || (!truthy(input.allSessions) && !view?.warm)) {
+        summary.filtered += 1;
+        continue;
+      }
+      const had = Boolean(session.pin);
+      const result = store.pinSession(session, { forSec: input.for ?? input.forSec, intervalSec: input.interval ?? input.intervalSec, source: input.source || 'api', reason: input.reason || null });
+      if (!result.ok) {
+        summary.skipped += 1;
+        const code = result.errors?.[0]?.code || 'unknown';
+        skippedBy[code] = (skippedBy[code] || 0) + 1;
+      } else if (had) summary.extended += 1;
+      else summary.pinned += 1;
+      results.push(result);
+    }
+    tick();
+    log(`global pin ${enabled ? 'set' : 'unset'} ttl=${ttl} pinned=${summary.pinned} extended=${summary.extended} unpinned=${summary.unpinned} skipped=${summary.skipped}`);
+    return { ok: enabled ? summary.pinned + summary.extended > 0 : true, global: true, enabled, ttl, results, summary, skippedBy, now: current };
   }
 
   // 回测在子进程里跑（要读几百 MB 会话记录，不能卡住转发），结果缓存 10 分钟

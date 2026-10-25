@@ -334,6 +334,27 @@ ${result.errors.map(error => `· ${error}`).join('\n')}`);
       h('span', { class: 'small' }, statusEl(enabled ? { cls: 'good', ico: '●' } : { cls: 'critical', ico: '■' }, enabled ? '保活总开关：开' : '保活总开关：关（不发任何心跳）')),
       h('button', { type: 'button', class: `btn${enabled ? '' : ' primary'}`, disabled: state.autoSaving, title: enabled ? '停掉所有会话的所有保活，并禁止新开' : '重新允许保活', onclick: toggleAll }, enabled ? '全部关闭' : '全部打开'),
       h('span', { class: 'muted small' }, '·'),
+      h('button', { type: 'button', class: 'btn', disabled: state.autoSaving, title: '所有缓存仍有效的 1h 主对话一起长保活 12 小时；人在工作时不发', onclick: async () => {
+        if (!window.confirm('给所有缓存仍有效的 1h 主对话设 12 小时长保活？只在空闲时发心跳。')) return;
+        try {
+          const result = await api('sessions/pin', { method: 'POST', body: { global: true, enabled: true, source: 'web' } });
+          const s = result.summary || {};
+          toast(`全局长保活：新设 ${s.pinned || 0} 个，延长 ${s.extended || 0} 个，跳过 ${s.skipped || 0} 个`);
+        } catch (error) {
+          toast(`操作失败：${error.message}`);
+        }
+        await refresh();
+      } }, '全部长保活 12h'),
+      state.health?.pinnedSessions ? h('button', { type: 'button', class: 'btn', disabled: state.autoSaving, onclick: async () => {
+        try {
+          const result = await api('sessions/pin', { method: 'POST', body: { global: true, enabled: false, source: 'web' } });
+          toast(`已取消 ${result.summary?.unpinned || 0} 个会话的长保活`);
+        } catch (error) {
+          toast(`操作失败：${error.message}`);
+        }
+        await refresh();
+      } }, `取消全部长保活（${state.health.pinnedSessions}）`) : null,
+      h('span', { class: 'muted small' }, '·'),
       statusEl(on ? { cls: 'good', ico: '◉' } : { cls: 'neutral', ico: '■' }, on ? '自动保活已开启' : '自动保活已关闭'),
       h('button', { type: 'button', class: `btn${on ? '' : ' primary'}`, disabled: state.autoSaving, onclick: () => save({ mode: on ? 'off' : 'on' }) }, on ? '全局关闭' : '全局开启'),
       auto.cooldownUntil ? h('span', { class: 'small' }, statusEl({ cls: 'warning', ico: '⏸' }, `有自动心跳没命中，暂停到 ${fmtTime(auto.cooldownUntil)}`), ' ',
@@ -587,7 +608,7 @@ function sessionRow(view, stats) {
     planCell.append(h('div', {}, statusEl(spec, `${SOURCE_LABEL[plan.source] || '手动'}${spec.label} ${plan.done}/${plan.count}`), h('span', { class: 'small muted' }, ` · 间隔 ${fmtInterval(plan.intervalSec)}`)));
     if (plan.status === 'active') {
       planCell.append(h('div', { class: 'meter' }, h('span', { style: `width:${Math.round((plan.done / plan.count) * 100)}%` })));
-      planCell.append(h('div', { class: 'small muted' }, `下一次 ${fmtTime(plan.nextPingAt)}（${planStateText(plan)}）· 已花 ${fmtUsd(plan.costUsd)}`));
+      planCell.append(h('div', { class: 'small muted' }, `下一次 ${fmtTime(plan.nextPingAt)}（${planStateText(plan)}）· 已花 ${fmtUsd(plan.costUsd)}${plan.saveUsd != null ? ` · 保住回来可省 ${fmtUsd(plan.saveUsd)}` : ''}`));
     } else {
       planCell.append(h('div', { class: 'small muted' }, `${fmtTime(plan.endedAt)} ${plan.reason || ''} · 花费 ${fmtUsd(plan.costUsd)}`));
     }
@@ -867,11 +888,12 @@ function renderEpisodes() {
     h('td', {}, `${SOURCE_LABEL[episode.source] || '手动'}${episode.trigger === 'tool-gap' ? '（工具空闲）' : ''}${episode.forced ? ' · 强制' : ''}`),
     h('td', {}, h('div', {}, pingDots(episode)), h('div', { class: 'small muted' }, `${episode.pings.length}/${episode.count ?? '?'} 次 · 间隔 ${fmtInterval(episode.intervalSec || 0)}`)),
     h('td', { class: 'r' }, fmtUsd(-episode.pingCostUsd), episode.pingCostEstimatedUsd ? h('div', { class: 'small muted' }, `含估 ${fmtUsd(episode.pingCostEstimatedUsd)}`) : null),
+    h('td', { class: 'r', title: '这段前缀保住后、人按时回来能省的整段重写费' }, episode.expectedSaveUsd != null ? fmtUsd(episode.expectedSaveUsd) : '—', episode.contextTokens ? h('div', { class: 'small muted' }, `${fmtTokens(episode.contextTokens)} tokens`) : null),
     h('td', {}, statusEl(spec), resumeText ? h('div', { class: 'small muted' }, resumeText) : null),
     h('td', { class: 'r' }, amountEl(episode.benefitUsd)),
     h('td', { class: 'r' }, amountEl(episode.netUsd, { zero: '0' })));
     rows.push(row);
-    rows.push(h('tr', { class: 'ep-detail', id: detailId, hidden: !open }, h('td', { colspan: 8 },
+    rows.push(h('tr', { class: 'ep-detail', id: detailId, hidden: !open }, h('td', { colspan: 9 },
       h('div', { class: 'small muted' }, `计划 ${episode.planId} · 开始 ${new Date(episode.startedAt).toLocaleString('zh-CN', { hour12: false })}${episode.idleStartAt ? ` · 空闲从 ${fmtTime(episode.idleStartAt)} 开始` : ''}${episode.end ? ` · ${fmtTime(episode.end.at)} ${PLAN_STATUS[episode.end.status]?.label || episode.end.status}${episode.end.reason ? `：${episode.end.reason}` : ''}` : ''}`),
       episode.resume ? h('div', { class: 'small' }, statusEl(episode.resume.kept ? { cls: 'good', ico: '✓' } : { cls: 'neutral', ico: '○' }, RESUME_REASON[episode.resume.reason] || episode.resume.reason), ` · 回来 ${new Date(episode.resume.at).toLocaleString('zh-CN', { hour12: false })}，距上次真实请求 ${fmtDuration(episode.resume.gapSec)}${episode.resume.kept ? ` · 少写 ${fmtTokens(episode.resume.savedTokens)} tokens，收益 ${fmtUsd(episode.resume.benefitUsd)}` : ''}`) : null,
       episode.pings.length ? h('ul', { class: 'ep-pings' }, episode.pings.map(ping => h('li', {},
@@ -882,7 +904,7 @@ function renderEpisodes() {
         h('span', { class: 'r' }, `${fmtUsd(ping.costUsd)}${ping.estimated ? '（估）' : ''}`)))) : h('div', { class: 'small muted' }, '没有发出心跳'))));
   }
   host.replaceChildren(summaryBar, h('table', { class: 'data episodes' },
-    h('thead', {}, h('tr', {}, h('th', {}, '开始'), h('th', {}, '任务 / 会话'), h('th', {}, '来源'), h('th', {}, '心跳'), h('th', { class: 'r' }, '心跳花费'), h('th', {}, '结局'), h('th', { class: 'r' }, '收益'), h('th', { class: 'r' }, '净'))),
+    h('thead', {}, h('tr', {}, h('th', {}, '开始'), h('th', {}, '任务 / 会话'), h('th', {}, '来源'), h('th', {}, '心跳'), h('th', { class: 'r' }, '心跳花费'), h('th', { class: 'r' }, '回来可省'), h('th', {}, '结局'), h('th', { class: 'r' }, '实际收益'), h('th', { class: 'r' }, '净'))),
     h('tbody', {}, rows)),
   list.length > 120 ? h('div', { class: 'small muted', style: 'margin-top:8px' }, `只显示最近 120 段，共 ${list.length} 段；用搜索缩小范围`) : null);
 }

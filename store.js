@@ -663,7 +663,8 @@ export class KeepaliveStore {
     this.persistSnapshot(lineage);
     this.appendEvent({
       t: 'plan', at: now, sid: session.id, plan: plan.id, action: 'start', count, intervalSec, immediate, forced: force, source,
-      cwd: session.cwd, model: lineage.model, ttl: lineage.ttl, idleStartAt: lineage.lastRealStartAt || null, ...extra,
+      cwd: session.cwd, model: lineage.model, ttl: lineage.ttl, idleStartAt: lineage.lastRealStartAt || null,
+      contextTokens: lineage.expectedCached, saveUsd: keepSavingUsd(lineage.expectedCached, { model: lineage.model, ttl: lineage.ttl, cfg: this.cfg }), ...extra,
     });
     this.prunePlans();
     this.scheduleSave();
@@ -1060,6 +1061,9 @@ export class KeepaliveStore {
       errorStreak: plan.errorStreak || 0,
       lastError: plan.lastError || null,
       costUsd: plan.costUsd,
+      contextTokens: lineage?.expectedCached ?? null,
+      // 保住后回来能省多少（这段前缀的整段重写 − 读取）
+      saveUsd: lineage && lineage.ttl ? keepSavingUsd(lineage.expectedCached, { model: lineage.model, ttl: lineage.ttl, cfg: this.cfg }) : null,
       nextPingAt: plan.status === 'active' ? this.planNextPingAt(plan, lineage) : null,
       inflight: plan.inflight,
       now,
@@ -1237,8 +1241,13 @@ export class KeepaliveStore {
       const detail = `只读到 ${usage.cacheRead}/${expected} tokens、重写 ${usage.cacheWrite}`;
       lineage.blocked = { at: result.startedAt, detail };
       this.finishPlan(plan, 'stopped', `心跳没命中会话缓存（${detail}），已停止并锁定该会话`);
-      const pinnedSession = this.sessions.get(lineage.sessionId);
-      if (plan.source === 'pin' && pinnedSession?.pin) this.unpinSession(pinnedSession, { source: 'guard', reason: `心跳没命中会话缓存（${detail}），已锁定并取消长保活`, action: 'cancelled' });
+      // 一次未命中就停掉这个会话的全部保活（自动 / 长保活 / 手动都不再发），直到人工 auto on 确认；锁定记在谱系上，
+      // 会话级关闭记在会话上——换模型产生新谱系也不会绕过
+      const missedSession = this.sessions.get(lineage.sessionId);
+      if (missedSession) {
+        if (missedSession.pin) this.unpinSession(missedSession, { source: 'guard', reason: `心跳没命中会话缓存（${detail}），已锁定并取消长保活`, action: 'cancelled' });
+        if (!missedSession.autoDisabled) this.setSessionAuto(missedSession, false, { source: 'guard', reason: `心跳没命中（${detail}），该会话全部保活已停止；确认后 cache-keepalive auto on 恢复` });
+      }
       this.notify({ kind: 'miss', title: `${source === 'auto' ? '自动' : '手动'}心跳没命中，会话已锁定`, text: `会话 ${lineage.sessionId.slice(0, 8)}（${lineage.model}）${detail}，这一发按整段重写计费 $${costUsd.toFixed(3)}；确认后用 auto on / ping --force 解锁`, sessionId: lineage.sessionId, planId: plan.id, costUsd });
       if (source === 'auto') {
         // 1h 缓存在 50 分钟时没命中不正常（上游换了账号、改了 TTL 等）：全局暂停新的自动保活，避免一连串整段重写
@@ -1322,7 +1331,7 @@ export class KeepaliveStore {
     const now = this.now();
     const since = now - days * DAY_MS;
     const events = sessionId ? this.events.filter(event => event.sid && String(event.sid).startsWith(sessionId)) : this.events;
-    const built = buildEpisodes(events, { now, since, limit });
+    const built = buildEpisodes(events, { now, since, limit, cfg: this.cfg });
     for (const episode of built.episodes) {
       const session = this.sessions.get(episode.sessionId);
       if (!episode.cwd && session?.cwd) episode.cwd = session.cwd;

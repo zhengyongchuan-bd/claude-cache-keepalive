@@ -23,8 +23,10 @@ const HELP = `用法: cache-keepalive [命令] [选项]      在任务的工作�
 日常只需要这几条:
   status (默认)         当前会话：缓存剩余、自动/长保活状态、上次心跳、能否保活
   list                  所有会话一览：TTL / 前缀 / 缓存剩余 / 计划 / 自动保活（--active 只看有计划的，--warm 只看缓存有效的）
-  pin [--for 12h]       当前会话长保活（默认 12h，最长 48h）：每段空闲都心跳到到期，人在工作时不发
+  pin [--for 12h]       当前会话长保活（默认 12h，最长 48h）：每段空闲都心跳到到期，人在工作时不发；按时长不按次数
   unpin                 取消当前会话的长保活
+  pin --global [...]    所有缓存仍有效的 1h 主对话一起长保活（--ttl 5m|any；--all-sessions 连已过期的也设，等它们下次请求后接上）
+  unpin --global        取消所有会话的长保活
   stop                  停掉当前会话的一切保活：计划、长保活，并关闭它的自动保活（auto on 恢复）
   off / on              总开关：off 停掉所有会话的所有保活（自动/手动/长保活）且不能再开；on 打开
 
@@ -67,6 +69,7 @@ const HELP = `用法: cache-keepalive [命令] [选项]      在任务的工作�
   cache-keepalive                      # 看当前任务
   cache-keepalive pin                  # 当前任务长保活 12 小时
   cache-keepalive pin --for 24h --session 3d7c
+  cache-keepalive pin --global                  # 所有正在跑的 1h 会话长保活 12 小时
   cache-keepalive stop                 # 当前任务全停
   cache-keepalive off --reason 下班     # 全部停、不再发；明天 cache-keepalive on
   cache-keepalive list --active        # 谁在保活
@@ -84,6 +87,7 @@ function parseArgs(argv) {
     if (value === '--session' || value === '-s') opts.session = next();
     else if (value === '--cwd') opts.cwd = path.resolve(next());
     else if (value === '--all') opts.all = true;
+    else if (value === '--all-sessions') opts.allSessions = true;
     else if (value === '--count' || value === '-n') opts.count = next();
     else if (value === '--max') opts.count = 'max';
     else if (value === '--interval' || value === '-i') opts.interval = next();
@@ -278,7 +282,7 @@ function printSession(view, now) {
     const u = p.lastPing.usage;
     console.log(`  上次心跳 ${fmtTime(p.lastPing.at)} ${OUTCOME_LABELS[p.lastPing.outcome] || p.lastPing.outcome} read=${fmtTokens(u?.cacheRead)} write=${fmtTokens(u?.cacheWrite)} ${fmtUsd(p.lastPing.costUsd)}`);
   }
-  if (p.blocked) console.log(`  ⚠ 已锁定：上次心跳未命中缓存（${p.blocked.detail}），需 --force 或 auto on 才能再保活`);
+  if (p.blocked) console.log(`  ⚠ 已锁定：上次心跳未命中缓存（${p.blocked.detail}），该会话全部保活已停止；人工确认后 cache-keepalive auto on 恢复（或 ping --force 试一次）`);
   if (p.ttlDowngraded) console.log('  ⚠ 请求标了 1h，上游实际按 5m 写入缓存：1h 间隔的心跳不会命中');
   if (p.pingAnomaly) console.log(`  ⚠ 上次心跳产生了 ${p.pingAnomaly.output} 个输出 token（上游没遵守 max_tokens），已停发`);
   if (view.pin) console.log(`  长保活：到 ${fmtDateTime(view.pin.untilAt)}（剩 ${fmtDuration(view.pin.remainingSec)}，每 ${fmtInterval(view.pin.intervalSec)} 一次，只在空闲时发）${view.pin.active ? ' · 本段空闲心跳中' : ''}；取消：cache-keepalive unpin`);
@@ -288,7 +292,7 @@ function printSession(view, now) {
   const plan = view.plan;
   if (plan) {
     const head = `  ${SOURCE_LABELS[plan.source] || '手动'}计划 ${PLAN_STATUS[plan.status] || plan.status} ${plan.done}/${plan.count} 次 · 间隔 ${fmtInterval(plan.intervalSec)} · 心跳花费 ${fmtUsd(plan.costUsd)}`;
-    if (plan.status === 'active') console.log(`${head} · 下一次 ${fmtTime(plan.nextPingAt)}（${planStateText(plan)}）`);
+    if (plan.status === 'active') console.log(`${head} · 下一次 ${fmtTime(plan.nextPingAt)}（${planStateText(plan)}）${plan.saveUsd != null ? ` · 保住后回来可省约 ${fmtUsd(plan.saveUsd)}` : ''}`);
     else console.log(`${head}${plan.reason ? ` · ${plan.reason}` : ''}`);
   }
   if (view.check && plan?.status !== 'active') {
@@ -454,7 +458,8 @@ function printEpisodes(result) {
     const marks = e.pings.map(p => PING_MARK[p.outcome] || '·').join('') || '-';
     const outcome = EPISODE_OUTCOME_LABELS[e.outcome] || e.outcome;
     const resume = e.resume ? ` · 回来 ${fmtTime(e.resume.at)}（空闲 ${fmtDuration(e.resume.gapSec)}）` : '';
-    console.log(`${fmtDateTime(e.startedAt)}  ${SOURCE_LABELS[e.source] || '手动'}${e.trigger === 'tool-gap' ? '(工具空闲)' : ''} ${short(e.sessionId)}${title}  心跳 ${e.pings.length}/${e.count ?? '?'} ${marks}  花费 ${fmtUsd(e.pingCostUsd)}  收益 ${fmtUsd(e.benefitUsd)}  净 ${fmtUsd(e.netUsd)}`);
+    const expect = e.expectedSaveUsd != null ? `  回来可省约 ${fmtUsd(e.expectedSaveUsd)}` : '';
+    console.log(`${fmtDateTime(e.startedAt)}  ${SOURCE_LABELS[e.source] || '手动'}${e.trigger === 'tool-gap' ? '(工具空闲)' : ''} ${short(e.sessionId)}${title}  心跳 ${e.pings.length}/${e.count ?? '?'} ${marks}  花费 ${fmtUsd(e.pingCostUsd)}${expect}  实际收益 ${fmtUsd(e.benefitUsd)}  净 ${fmtUsd(e.netUsd)}`);
     console.log(`  ${e.active ? '进行中' : outcome}${resume}${e.end?.reason && !e.active ? ` · ${e.end.reason}` : ''}`);
     for (const p of e.pings) {
       const usage = p.cacheRead != null ? `read=${fmtTokens(p.cacheRead)} write=${fmtTokens(p.cacheWrite)} out=${p.output ?? 0}` : (p.error || '-');
@@ -915,8 +920,28 @@ async function main() {
     return undefined;
   }
   if (command === 'pin' || command === 'unpin') {
-    if (opts.global) throw new Error(`${command} 不支持 --global：长保活针对具体会话；全局批量用 start --global --for`);
     if (command === 'pin' && opts.count != null) throw new Error('pin 按时长设置，用 --for 12h，不用 --count');
+    if (opts.global) {
+      if (opts.session || opts.cwd) throw new Error(`${command} --global 不能和 --session / --cwd 一起使用`);
+      const result = await api(opts, 'POST', 'sessions/pin', { global: true, enabled: command === 'pin', for: opts.for, interval: opts.interval, ttl: opts.ttl, allSessions: opts.allSessions, reason: opts.reason || null, source: 'cli' }, 60000);
+      if (opts.json) return out(result);
+      if (result.error) throw new Error(result.error);
+      const s = result.summary || {};
+      if (command === 'unpin') {
+        console.log(`✓ 已取消 ${s.unpinned || 0} 个会话的长保活`);
+        return undefined;
+      }
+      const reasons = Object.entries(result.skippedBy || {}).sort((a, b) => b[1] - a[1]).map(([code, n]) => `${planErrorLabel(code)} ${n}`).join('，');
+      console.log(`${result.ok ? '✓' : '○'} 全局长保活（${result.ttl === 'any' ? '所有 TTL' : result.ttl}）：新设 ${s.pinned || 0} 个，延长 ${s.extended || 0} 个，跳过 ${s.skipped || 0} 个${reasons ? `（${reasons}）` : ''}`);
+      if (s.filtered) console.log(`  另有 ${s.filtered} 个会话不在范围（不是主对话 / TTL 不匹配 / 缓存已过期；--all-sessions 可连已过期的一起设）`);
+      for (const item of (result.results || []).filter(r => r.ok && r.pin).slice(0, 12)) {
+        const e = item.estimate;
+        console.log(`  ✓ ${short(item.sessionId)} 到 ${fmtDateTime(item.pin.untilAt)}${e ? `，前缀 ${fmtTokens(e.contextTokens)}，每次约 ${fmtUsd(e.pingUsd)}，整段空闲最多 ${e.maxPings} 次 ${fmtUsd(e.maxUsd)}，保住回来省 ${fmtUsd(e.saveUsd)}` : ''}`);
+      }
+      for (const item of (result.results || []).filter(r => !r.ok).slice(0, 10)) console.log(`  ✗ ${short(item.sessionId)} ${(item.errors || []).map(e => e.message).join('；')}`);
+      if (!result.ok) process.exitCode = 2;
+      return undefined;
+    }
     const result = await api(opts, 'POST', 'sessions/pin', { ...target(opts), enabled: command === 'pin', for: opts.for, interval: opts.interval, all: opts.all, reason: opts.reason || null, source: 'cli' });
     if (opts.json) return out(result);
     if (result.error) throw new Error(result.error);

@@ -1050,7 +1050,7 @@ export const EPISODE_OUTCOME_LABELS = Object.freeze({
 
 // events 按时间升序；返回 { episodes: [...最近的在前], totals }。since 按计划开始时间筛（心跳/回来事件全量参与聚合，
 // 这样窗口边缘的计划也能拿到完整的心跳列表）
-export function buildEpisodes(events, { now = Date.now(), since = 0, limit = 200 } = {}) {
+export function buildEpisodes(events, { now = Date.now(), since = 0, limit = 200, cfg = DEFAULT_CONFIG } = {}) {
   const byPlan = new Map();
   const list = [];
   const open = (planId, seed) => {
@@ -1070,6 +1070,9 @@ export function buildEpisodes(events, { now = Date.now(), since = 0, limit = 200
         count: seed.count ?? null,
         intervalSec: seed.intervalSec ?? null,
         forced: Boolean(seed.forced),
+        contextTokens: seed.contextTokens ?? null,
+        // 这段保活保住后、人按时回来能省多少（整段重写 − 读取）；实际收益见 benefitUsd
+        expectedSaveUsd: seed.saveUsd ?? null,
         pings: [],
         hits: 0,
         misses: 0,
@@ -1117,6 +1120,7 @@ export function buildEpisodes(events, { now = Date.now(), since = 0, limit = 200
       });
       episode.pingCostUsd += event.costUsd || 0;
       if (event.estimated) episode.pingCostEstimatedUsd += event.costUsd || 0;
+      if (event.expected) episode.contextTokens = Math.max(episode.contextTokens || 0, event.expected);
       episode.lastPingAt = Math.max(episode.lastPingAt, event.at);
       if (event.outcome === 'hit') {
         episode.hits += 1;
@@ -1136,6 +1140,9 @@ export function buildEpisodes(events, { now = Date.now(), since = 0, limit = 200
   const kept = [];
   for (const episode of list) {
     const ttlMs = (TTL_SEC[episode.ttl] || 0) * 1000;
+    if (episode.expectedSaveUsd == null && episode.contextTokens && episode.ttl) {
+      episode.expectedSaveUsd = keepSavingUsd(episode.contextTokens, { model: episode.model, ttl: episode.ttl, cfg });
+    }
     if (episode.resume) {
       episode.outcome = episode.resume.kept ? 'kept' : episode.resume.reason;
       // 收益只记给最后一次命中心跳所在的计划，避免同一段空闲里多个计划重复计

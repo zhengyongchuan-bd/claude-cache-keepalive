@@ -905,7 +905,9 @@ test('自动保活：心跳没命中即锁定该会话，并全局暂停新的�
   clock.t += 3 * 60 * MIN;
   await sendMessages(relay, ['hello', 'ok', 'more', 'ok', 'again']);
   await idle(relay, clock, 50);
-  assert.equal(relay.store.primaryLineage(relay.store.sessions.get(SID)).autoEpisode.code, 'blocked');
+  // 未命中后整个会话的保活都停：新谱系也不自动（会话级关闭优先于谱系锁定）
+  assert.equal(relay.store.primaryLineage(relay.store.sessions.get(SID)).autoEpisode.code, 'session-stopped');
+  assert.match(relay.store.sessions.get(SID).autoDisabled.reason, /auto on 恢复/);
   const health = (await control(relay, 'GET', 'health')).json;
   assert.equal(health.auto.cooldownUntil, null, '冷却到期');
 });
@@ -1703,10 +1705,9 @@ test('长保活：心跳未命中即锁定并取消长保活；unpin / stop 也�
   const stopped = await control(relay, 'POST', 'plans/stop', { cwd: '/tmp/ka-ws' });
   assert.deepEqual(stopped.json.unpinned, [SID]);
   assert.equal(relay.store.sessions.get(SID).pin, null);
-  // 不提供 --global
-  const global = await control(relay, 'POST', 'sessions/pin', { global: true });
-  assert.equal(global.json.ok, false);
-  assert.match(global.json.error, /不提供 --global/);
+  // --global 不能和 --session 混用
+  const mixed = await control(relay, 'POST', 'sessions/pin', { global: true, session: SID });
+  assert.equal(mixed.json.ok, false);
 });
 
 test('长保活：自动保活让位；手动计划优先并在结束后由长保活接上；Paseo 归档即取消；空闲已超安全窗口的那段不发', async t => {
@@ -1897,4 +1898,87 @@ test('自动保活：没有 Paseo 时按进程探测——会话的 claude 进�
   relay.tick();
   await relay.flush();
   assert.equal(autoPlans(relay).length, 1);
+});
+
+
+// ---------------------------------------------------------------- 2026-10-26：预计节省 / 未命中整会话停 / pin --global
+
+test('执行记录与计划视图带「回来可省」预计节省；未命中后该会话全部保活停止（自动 / 长保活 / 新谱系），auto on 才恢复', async t => {
+  const { clock, upstream, relay } = await setup(t, AUTO);
+  await sendMessages(relay, ['hello']);
+  await control(relay, 'POST', 'sessions/pin', { session: SID });
+  clock.t += 50 * MIN;
+  relay.tick();
+  await relay.flush();
+  let view = (await control(relay, 'GET', `sessions?session=${SID}`)).json.sessions[0];
+  assert.ok(view.plan.saveUsd > 0, '计划视图带预计节省');
+  assert.equal(view.plan.contextTokens, view.primary.contextTokens);
+  const episodes = (await control(relay, 'GET', 'episodes?days=7')).json.episodes;
+  assert.ok(episodes[0].expectedSaveUsd > 0);
+  assert.ok(Math.abs(episodes[0].expectedSaveUsd - view.plan.saveUsd) < 1e-9, '执行记录与计划口径一致');
+  assert.equal(episodes[0].contextTokens, view.primary.contextTokens);
+  // 未命中：缓存被清 → 锁定 + 取消长保活 + 会话级关闭自动
+  clock.t += 50 * MIN;
+  upstream.cache.clear();
+  relay.tick();
+  await relay.flush();
+  view = (await control(relay, 'GET', `sessions?session=${SID}`)).json.sessions[0];
+  assert.ok(view.primary.blocked);
+  assert.equal(view.pin, null);
+  assert.equal(view.auto.state, 'stopped');
+  assert.match(view.auto.disabled.reason, /auto on 恢复/);
+  // 新请求换了模型（新谱系）后空闲到点：仍不自动保活
+  const other = claudeRequest(['hello', 'ok', 'switch model']);
+  other.model = 'passthrough/claude-sonnet-5-5';
+  await request(relay.port, { method: 'POST', path: '/v1/messages', body: other, headers: claudeHeaders(SID) });
+  assert.equal(relay.store.sessionLineages(relay.store.sessions.get(SID)).length, 2);
+  clock.t += 50 * MIN;
+  relay.tick();
+  await relay.flush();
+  assert.equal(autoPlans(relay).length, 0, '换模型也不绕过');
+  assert.equal(relay.store.primaryLineage(relay.store.sessions.get(SID)).autoEpisode.code, 'session-stopped');
+  // 人工操作即确认：auto on 恢复自动；pin 是人工显式动作，可直接设
+  const re = await control(relay, 'POST', 'sessions/auto', { session: SID, enabled: true });
+  assert.equal(re.json.ok, true);
+  view = (await control(relay, 'GET', `sessions?session=${SID}`)).json.sessions[0];
+  assert.notEqual(view.auto.state, 'stopped');
+  assert.equal((await control(relay, 'POST', 'sessions/pin', { session: SID })).json.results[0].ok, true);
+});
+
+test('pin --global：只给缓存仍有效的 1h 主对话设长保活，已有的延长；--all-sessions 连过期的也设；unpin --global 全部取消', async t => {
+  const { clock, relay } = await setup(t, { auto: { mode: 'off' } });
+  const SID2 = '22222222-3333-4444-5555-666666666666';
+  const SID3 = '33333333-4444-5555-6666-777777777777';
+  await sendMessages(relay, ['a'], { sessionId: SID, cwd: '/tmp/ka-a' });
+  await sendMessages(relay, ['b'], { sessionId: SID2, cwd: '/tmp/ka-b' });
+  const five = claudeRequest(['c'], { sessionId: SID3, cwd: '/tmp/ka-c' });
+  five.system[0].cache_control = { type: 'ephemeral' };
+  five.messages[0].content[0].cache_control = { type: 'ephemeral' };
+  await request(relay.port, { method: 'POST', path: '/v1/messages', body: five, headers: claudeHeaders(SID3) });
+  assert.equal(relay.store.primaryLineage(relay.store.sessions.get(SID3)).ttl, '5m');
+  // SID 已有长保活 6h → 延长到 12h
+  await control(relay, 'POST', 'sessions/pin', { session: SID, for: '6h' });
+  const res = await control(relay, 'POST', 'sessions/pin', { global: true });
+  assert.equal(res.json.ok, true, JSON.stringify(res.json));
+  assert.equal(res.json.summary.pinned, 1);
+  assert.equal(res.json.summary.extended, 1);
+  assert.equal(res.json.summary.filtered, 1, '5m 会话不在默认范围');
+  assert.equal(relay.store.sessions.get(SID).pin.durationSec, 12 * 3600);
+  assert.ok(relay.store.sessions.get(SID2).pin);
+  assert.ok(!relay.store.sessions.get(SID3).pin);
+  assert.equal((await control(relay, 'GET', 'health')).json.pinnedSessions, 2);
+  // 全部取消
+  const un = await control(relay, 'POST', 'sessions/pin', { global: true, enabled: false });
+  assert.equal(un.json.summary.unpinned, 2);
+  assert.equal((await control(relay, 'GET', 'health')).json.pinnedSessions, 0);
+  // 缓存过期的默认跳过，--all-sessions 也设（等下一次请求后接上，这段不发）
+  clock.t += 70 * MIN;
+  const skipExpired = await control(relay, 'POST', 'sessions/pin', { global: true });
+  assert.equal(skipExpired.json.ok, false);
+  assert.equal(skipExpired.json.summary.filtered, 3);
+  const all = await control(relay, 'POST', 'sessions/pin', { global: true, allSessions: true, ttl: 'any' });
+  assert.equal(all.json.summary.pinned, 3);
+  relay.tick();
+  await relay.flush();
+  assert.equal(relay.store.activePlans().length, 0, '过期这段不发心跳');
 });
