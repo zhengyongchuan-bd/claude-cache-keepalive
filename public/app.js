@@ -593,21 +593,22 @@ function sessionRow(view, stats) {
     const spec = (auto.code === 'keepalive-off' ? AUTO_STATE['keepalive-off'] : AUTO_STATE[auto.state]) || { cls: 'neutral', ico: '·', label: auto.state };
     let detail = '';
     if (auto.state === 'armed') detail = `${fmtTime(auto.dueAt)} 还没有新请求就自动心跳`;
-    else if (auto.state === 'pinned') detail = `到 ${new Date(auto.untilAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`;
+    else if (auto.state === 'pinned') detail = auto.untilAt == null ? '长期' : `到 ${new Date(auto.untilAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`;
     else if (auto.state === 'active') detail = auto.trigger === 'tool-gap' ? '工具/子代理执行中的空闲' : '空闲中';
     else if (auto.state === 'stopped') detail = `${auto.disabled?.reason || '手动停止'} · ${fmtTime(auto.disabled?.at)}`;
     else if (auto.message || auto.code) detail = auto.message || autoLabel(auto.code);
     planCell.append(h('div', { class: 'auto-line' }, statusEl(spec, `自动：${spec.label}`), detail ? h('span', { class: 'small muted' }, ` ${detail}`) : null));
   }
   if (view.pin) {
-    planCell.append(h('div', { class: 'auto-line' }, statusEl({ cls: 'good', ico: '📌' }, '长保活'), h('span', { class: 'small muted' }, ` 到 ${new Date(view.pin.untilAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })} · 剩 ${fmtDuration(view.pin.remainingSec)} · 每 ${fmtInterval(view.pin.intervalSec)} · 只在空闲时发`)));
+    const until = view.pin.untilAt == null ? '长期（直到取消）' : `到 ${new Date(view.pin.untilAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })} · 剩 ${fmtDuration(view.pin.remainingSec)}`;
+    planCell.append(h('div', { class: 'auto-line' }, statusEl({ cls: 'good', ico: '📌' }, '长保活'), h('span', { class: 'small muted' }, ` ${until} · 每 ${fmtInterval(view.pin.intervalSec)} · 只在空闲时发`)));
   }
   const plan = view.plan;
   if (plan) {
     const spec = PLAN_STATUS[plan.status] || { cls: 'neutral', ico: '·', label: plan.status };
-    planCell.append(h('div', {}, statusEl(spec, `${SOURCE_LABEL[plan.source] || '手动'}${spec.label} ${plan.done}/${plan.count}`), h('span', { class: 'small muted' }, ` · 间隔 ${fmtInterval(plan.intervalSec)}`)));
+    planCell.append(h('div', {}, statusEl(spec, `${SOURCE_LABEL[plan.source] || '手动'}${spec.label} ${plan.done}/${plan.count ?? '∞'}`), h('span', { class: 'small muted' }, ` · 间隔 ${fmtInterval(plan.intervalSec)}`)));
     if (plan.status === 'active') {
-      planCell.append(h('div', { class: 'meter' }, h('span', { style: `width:${Math.round((plan.done / plan.count) * 100)}%` })));
+      if (plan.count != null) planCell.append(h('div', { class: 'meter' }, h('span', { style: `width:${Math.round((plan.done / plan.count) * 100)}%` })));
       planCell.append(h('div', { class: 'small muted' }, `下一次 ${fmtTime(plan.nextPingAt)}（${planStateText(plan)}）· 已花 ${fmtUsd(plan.costUsd)}${plan.saveUsd != null ? ` · 保住回来可省 ${fmtUsd(plan.saveUsd)}` : ''}`));
     } else {
       planCell.append(h('div', { class: 'small muted' }, `${fmtTime(plan.endedAt)} ${plan.reason || ''} · 花费 ${fmtUsd(plan.costUsd)}`));
@@ -689,16 +690,25 @@ function actionsCell(view) {
     toast(enabled ? '已恢复该会话的自动保活' : '已关闭该会话的自动保活（进行中的计划一并停止）');
   });
   const pinHours = h('input', { type: 'number', min: 1, max: Math.round((state.health?.defaults?.pin?.maxSec || 172800) / 3600), step: 1, value: draft('pinHours') || String(Math.round((state.health?.defaults?.pin?.defaultSec || 43200) / 3600)), 'aria-label': '长保活小时数', oninput: remember('pinHours'), style: 'width:64px' });
-  const pin = run('设置长保活', async () => {
-    const hours = Number(draft('pinHours') || Math.round((state.health?.defaults?.pin?.defaultSec || 43200) / 3600));
-    const result = await api('sessions/pin', { method: 'POST', body: { session: id, enabled: true, for: `${hours}h`, source: 'web' } });
+  const doPin = async body => {
+    const result = await api('sessions/pin', { method: 'POST', body: { session: id, enabled: true, source: 'web', ...body } });
     const item = result.results?.[0];
     if (!item?.ok) {
       toast(`无法设长保活：\n${(item?.errors || [{ message: result.error }]).map(error => `· ${error.message}`).join('\n')}`);
       return;
     }
     const e = item.estimate;
-    toast(`已设长保活到 ${new Date(item.pin.untilAt).toLocaleString('zh-CN', { hour12: false })}：只在空闲时每 ${fmtInterval(item.pin.intervalSec)} 一次，整段都空闲最多 ${e.maxPings} 次 ${fmtUsd(e.maxUsd)}；人在工作时不发${item.warnings?.length ? `\n${item.warnings.join('\n')}` : ''}`);
+    const bound = e.maxPings == null ? `整天空闲约 ${e.perDayPings} 次 ${fmtUsd(e.perDayUsd)}/天` : `整段都空闲最多 ${e.maxPings} 次 ${fmtUsd(e.maxUsd)}`;
+    const until = item.pin.untilAt == null ? '长期保活（直到取消）' : `长保活到 ${new Date(item.pin.untilAt).toLocaleString('zh-CN', { hour12: false })}`;
+    toast(`已设${until}：只在空闲时每 ${fmtInterval(item.pin.intervalSec)} 一次，${bound}；人在工作时不发${item.warnings?.length ? `\n${item.warnings.join('\n')}` : ''}`);
+  };
+  const pin = run('设置长保活', async () => {
+    const hours = Number(draft('pinHours') || Math.round((state.health?.defaults?.pin?.defaultSec || 43200) / 3600));
+    await doPin({ for: `${hours}h` });
+  });
+  const pinForever = run('长期保活', async () => {
+    if (!window.confirm('长期保活没有到期时刻，每段空闲都会一直心跳到人回来；未命中、任务进程退出、每日额度照常生效。确定？')) return;
+    await doPin({ forever: true });
   });
   const unpin = run('取消长保活', async () => {
     const result = await api('sessions/pin', { method: 'POST', body: { session: id, enabled: false, source: 'web' } });
@@ -720,7 +730,7 @@ function actionsCell(view) {
     h('div', { class: 'action-row' },
       view.pin
         ? h('button', { type: 'button', class: 'btn', disabled: busy, title: '取消长保活（进行中的心跳计划一并停止）', onclick: unpin }, '取消长保活')
-        : [pinHours, h('span', { class: 'small muted' }, '小时'), h('button', { type: 'button', class: 'btn', disabled: busy || !p, title: '期间每段空闲都按间隔心跳直到到期；人在工作时不发；未命中即锁定并取消', onclick: pin }, '长保活')]));
+        : [pinHours, h('span', { class: 'small muted' }, '小时'), h('button', { type: 'button', class: 'btn', disabled: busy || !p, title: '期间每段空闲都按间隔心跳直到到期；人在工作时不发；未命中即锁定并取消', onclick: pin }, '长保活'), h('button', { type: 'button', class: 'btn', disabled: busy || !p, title: '没有到期时刻，直到取消；每段空闲都心跳到人回来；未命中、任务进程退出、每日额度照常', onclick: pinForever }, '长期')]));
   if (check && !check.ok && !activePlan) cell.append(h('ul', { class: 'reasons' }, check.errors.map(error => h('li', {}, `${error.message}${error.soft ? '（可强制）' : ''}`))));
   return cell;
 }
@@ -764,7 +774,7 @@ function renderEvents() {
     if (event.t === 'global') {
       what = h('span', {}, statusEl(event.action === 'off' ? { cls: 'critical', ico: '■' } : { cls: 'good', ico: '●' }, event.action === 'off' ? `保活全局关闭（停 ${event.stopped} 个计划、取消 ${event.unpinned} 个长保活）` : '保活全局打开'), event.reason ? ` · ${event.reason}` : '');
     } else if (event.t === 'pin') {
-      const label = { set: `设长保活到 ${fmtTime(event.untilAt)}`, extend: `延长长保活到 ${fmtTime(event.untilAt)}`, unset: '取消长保活', expired: '长保活到期', cancelled: '长保活取消', 'missed-window': '长保活：本段空闲已超安全窗口，等下一次请求' }[event.action] || event.action;
+      const label = { set: event.untilAt == null ? '设长期保活' : `设长保活到 ${fmtTime(event.untilAt)}`, extend: event.untilAt == null ? '长保活改为长期' : `延长长保活到 ${fmtTime(event.untilAt)}`, unset: '取消长保活', expired: '长保活到期', cancelled: '长保活取消', 'missed-window': '长保活：本段空闲已超安全窗口，等下一次请求', 'agent-closed': '长保活：任务进程已退出，本段空闲不发' }[event.action] || event.action;
       what = h('span', {}, statusEl({ cls: event.action === 'set' || event.action === 'extend' ? 'good' : 'neutral', ico: '📌' }, label), ` ${sessionLabel(event.sid)}${event.reason ? ` · ${event.reason}` : ''}`);
     } else if (event.t === 'ping') {
       what = h('span', {}, statusEl(event.outcome, `${event.source === 'auto' ? '自动' : event.source === 'pin' ? '长保活' : ''}心跳${OUTCOME[event.outcome]?.label || event.outcome}`), ` ${sessionLabel(event.sid)} · 读 ${fmtTokens(event.usage?.cacheRead)}${event.usage?.cacheWrite ? ` · 写 ${fmtTokens(event.usage.cacheWrite)}` : ''}${event.error ? ` · ${event.error}` : ''}`);
@@ -886,7 +896,7 @@ function renderEpisodes() {
     h('td', {}, `${new Date(episode.startedAt).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })} ${fmtTime(episode.startedAt)}`),
     h('td', { title: `${episode.sessionId}\n${episode.cwd || ''}` }, h('div', {}, title.length > 36 ? `${title.slice(0, 36)}…` : title), h('div', { class: 'small muted' }, `${shortId(episode.sessionId)} · ${shortModel(episode.model)}${episode.ttl ? ` · ${episode.ttl}` : ''}`)),
     h('td', {}, `${SOURCE_LABEL[episode.source] || '手动'}${episode.trigger === 'tool-gap' ? '（工具空闲）' : ''}${episode.forced ? ' · 强制' : ''}`),
-    h('td', {}, h('div', {}, pingDots(episode)), h('div', { class: 'small muted' }, `${episode.pings.length}/${episode.count ?? '?'} 次 · 间隔 ${fmtInterval(episode.intervalSec || 0)}`)),
+    h('td', {}, h('div', {}, pingDots(episode)), h('div', { class: 'small muted' }, `${episode.pings.length}/${episode.count ?? (episode.source === 'pin' ? '∞' : '?')} 次 · 间隔 ${fmtInterval(episode.intervalSec || 0)}`)),
     h('td', { class: 'r' }, fmtUsd(-episode.pingCostUsd), episode.pingCostEstimatedUsd ? h('div', { class: 'small muted' }, `含估 ${fmtUsd(episode.pingCostEstimatedUsd)}`) : null),
     h('td', { class: 'r', title: '这段前缀保住后、人按时回来能省的整段重写费' }, episode.expectedSaveUsd != null ? fmtUsd(episode.expectedSaveUsd) : '—', episode.contextTokens ? h('div', { class: 'small muted' }, `${fmtTokens(episode.contextTokens)} tokens`) : null),
     h('td', {}, statusEl(spec), resumeText ? h('div', { class: 'small muted' }, resumeText) : null),

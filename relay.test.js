@@ -1982,3 +1982,60 @@ test('pin --global：只给缓存仍有效的 1h 主对话设长保活，已有�
   await relay.flush();
   assert.equal(relay.store.activePlans().length, 0, '过期这段不发心跳');
 });
+
+
+test('长期保活（--forever）：没有到期时刻，每段空闲不限次数直到人回来；任务进程退出的空闲段不发，resume 后接上；unpin 取消', async t => {
+  const agent = { value: { status: 'running', archived: false } };
+  const { clock, upstream, relay } = await setup(t, { auto: { mode: 'off' } }, { agentLookup: () => agent.value });
+  await sendMessages(relay, ['hello']);
+  const res = await control(relay, 'POST', 'sessions/pin', { session: SID, forever: true });
+  const item = res.json.results[0];
+  assert.equal(item.ok, true, JSON.stringify(res.json));
+  assert.equal(item.pin.untilAt, null);
+  assert.equal(item.pin.forever, true);
+  assert.equal(item.estimate.maxPings, null);
+  assert.ok(item.estimate.perDayPings >= 28 && item.estimate.perDayUsd > 0);
+  // 远超 48h 上限：仍在保活，每段空闲计划 count=null，不会「已完成」
+  const before = upstream.requests.length;
+  for (let i = 0; i < 20; i += 1) {
+    clock.t += 50 * MIN;
+    relay.tick();
+    await relay.flush();
+  }
+  assert.equal(upstream.requests.length - before, 20, '每 50 分钟一次，连续 20 次都发');
+  const plan = relay.store.activePlans()[0];
+  assert.equal(plan.source, 'pin');
+  assert.equal(plan.count, null);
+  assert.equal(plan.done, 20);
+  let view = (await control(relay, 'GET', `sessions?session=${SID}`)).json.sessions[0];
+  assert.equal(view.plan.remaining, null);
+  assert.equal(view.pin.remainingSec, null);
+  // 人回来：这段结束；进程退出后的空闲段不发，并只记一次事件
+  await sendMessages(relay, ['hello', 'ok', 'back']);
+  assert.equal(relay.store.activePlans().length, 0, '会话继续了，本段长保活结束');
+  agent.value = { status: 'closed', archived: false, source: 'process' };
+  const idleBefore = upstream.requests.length;
+  for (let i = 0; i < 3; i += 1) {
+    clock.t += 50 * MIN;
+    relay.tick();
+    await relay.flush();
+  }
+  assert.equal(upstream.requests.length, idleBefore, '任务进程已退出：不发');
+  assert.ok(relay.store.sessions.get(SID).pin, '但长保活还在，等 resume');
+  const closedEvents = relay.store.recentEvents(100).filter(event => event.t === 'pin' && event.action === 'agent-closed');
+  assert.equal(closedEvents.length, 1);
+  // resume 后又接上
+  agent.value = { status: 'running', archived: false };
+  await sendMessages(relay, ['hello', 'ok', 'back', 'ok', 'resume']);
+  clock.t += 50 * MIN;
+  relay.tick();
+  await relay.flush();
+  assert.equal(upstream.requests.length, idleBefore + 1 + 1, 'resume 请求 + 一次心跳');
+  // 全局 forever 与 unpin
+  const un = await control(relay, 'POST', 'sessions/pin', { session: SID, enabled: false });
+  assert.equal(un.json.results[0].changed, true);
+  assert.equal(relay.store.activePlans().length, 0);
+  const g = await control(relay, 'POST', 'sessions/pin', { global: true, forever: true });
+  assert.equal(g.json.summary.pinned, 1);
+  assert.equal(relay.store.sessions.get(SID).pin.untilAt, null);
+});

@@ -32,6 +32,8 @@ const DAY_MS = 86400 * 1000;
 const STALE_SESSION_MS = 7 * DAY_MS;
 const MAX_FINISHED_PLANS = 300;
 const TERMINAL_PLAN_STATUSES = new Set(['completed', 'stopped', 'cancelled', 'expired', 'replaced']);
+// 长期保活的写法：--forever、--for forever / always / 0
+export const isForever = value => value === true || value === 0 || ['forever', 'always', 'infinite', '0', 'true'].includes(String(value ?? '').trim().toLowerCase());
 // 落盘快照里去掉的凭证头；重启后心跳借用之后经过中继的、同一把凭证（按指纹匹配，凭证本身只在内存）
 const SECRET_HEADERS = new Set(['authorization', 'x-api-key', 'cookie', 'proxy-authorization']);
 const MAX_REMEMBERED_AUTH = 16;
@@ -759,7 +761,7 @@ export class KeepaliveStore {
     const pin = session.pin;
     if (!pin) return null;
     const plan = this.activePlanFor(session.id);
-    return { ...pin, remainingSec: Math.max(0, Math.round((pin.untilAt - now) / 1000)), active: plan?.source === 'pin', planId: plan?.source === 'pin' ? plan.id : null };
+    return { ...pin, forever: pin.untilAt == null, remainingSec: pin.untilAt == null ? null : Math.max(0, Math.round((pin.untilAt - now) / 1000)), active: plan?.source === 'pin', planId: plan?.source === 'pin' ? plan.id : null };
   }
 
   pinSession(session, { forSec = null, intervalSec = null, source = 'api', reason = null } = {}) {
@@ -775,29 +777,33 @@ export class KeepaliveStore {
     if (lineage.blocked) return fail('blocked', `上次心跳没命中会话缓存（${lineage.blocked.detail}），已锁定；先用 ping --force 确认能命中再设长保活`);
     const pinCfg = this.cfg.pin || {};
     const maxSec = Number(pinCfg.maxSec) || 48 * 3600;
-    const wantSec = forSec == null || forSec === '' ? (Number(pinCfg.defaultSec) || 12 * 3600) : parseDuration(forSec);
-    if (!Number.isFinite(wantSec) || wantSec <= 0) return fail('bad-duration', `无法解析长保活时长：${forSec}`);
+    // forever / always / 0：长期保活，没有到期时刻，直到人工取消或护栏停掉（未命中、心跳有输出、任务归档）
+    const forever = isForever(forSec);
+    const wantSec = forever ? null : forSec == null || forSec === '' ? (Number(pinCfg.defaultSec) || 12 * 3600) : parseDuration(forSec);
+    if (!forever && (!Number.isFinite(wantSec) || wantSec <= 0)) return fail('bad-duration', `无法解析长保活时长：${forSec}`);
     const warnings = [];
-    const durationSec = Math.min(maxSec, wantSec);
-    if (durationSec < wantSec) warnings.push(`长保活最长 ${Math.round(maxSec / 3600)} 小时，按上限执行`);
+    const durationSec = forever ? null : Math.min(maxSec, wantSec);
+    if (!forever && durationSec < wantSec) warnings.push(`长保活最长 ${Math.round(maxSec / 3600)} 小时，按上限执行；长期保活用 --forever`);
     let interval = intervalSec == null || intervalSec === '' ? settings.intervalSec : parseDuration(intervalSec);
     if (!Number.isFinite(interval)) return fail('bad-interval', `无法解析间隔：${intervalSec}`);
     const clamped = Math.min(settings.maxIntervalSec, Math.max(settings.minIntervalSec, Math.round(interval)));
     if (clamped !== Math.round(interval)) warnings.push(`间隔 ${Math.round(interval)}s 超出 ${lineage.ttl} 允许范围 [${settings.minIntervalSec}, ${settings.maxIntervalSec}]s，按 ${clamped}s 执行`);
     interval = clamped;
-    const untilAt = now + durationSec * 1000;
+    const untilAt = forever ? null : now + durationSec * 1000;
     const previous = session.pin || null;
     session.pin = { at: now, untilAt, durationSec, intervalSec: interval, source, reason, ttl: lineage.ttl };
     // 长保活接管后，进行中的自动计划让位（次数更长）；手动计划保留，结束后由长保活接上
     const active = this.activePlanFor(session.id);
     if (active?.source === 'auto') this.finishPlan(active, 'replaced', '被长保活接管');
     this.appendEvent({ t: 'pin', at: now, sid: session.id, action: previous ? 'extend' : 'set', untilAt, durationSec, intervalSec: interval, source, reason, cwd: session.cwd });
-    this.log(`pin session=${session.id.slice(0, 8)} until=${new Date(untilAt).toISOString()} interval=${interval}s`);
+    this.log(`pin session=${session.id.slice(0, 8)} until=${untilAt == null ? 'forever' : new Date(untilAt).toISOString()} interval=${interval}s`);
     // 已经空闲到点就立刻建计划（心跳由调度 tick 发）
     this.maybeStartPinPlan(session, now);
     this.scheduleSave();
     const pingUsd = pingCostEstimateUsd(lineage.expectedCached, { model: lineage.model, cfg: this.cfg });
-    const maxPings = Math.ceil(durationSec / interval);
+    // 上界：整段时间都空闲时的心跳次数；长期保活没有上界，按每天算（每日额度仍是硬上限）
+    const maxPings = forever ? null : Math.ceil(durationSec / interval);
+    const perDayPings = Math.ceil(86400 / interval);
     return {
       ok: true,
       sessionId: session.id,
@@ -805,7 +811,7 @@ export class KeepaliveStore {
       plan: this.activePlanFor(session.id) ? this.planView(this.activePlanFor(session.id), now) : null,
       warnings,
       // 上界：整段时间都空闲时的心跳次数与花费；人在工作的时段不发
-      estimate: { maxPings, pingUsd, maxUsd: maxPings * pingUsd, saveUsd: keepSavingUsd(lineage.expectedCached, { model: lineage.model, ttl: lineage.ttl, cfg: this.cfg }), contextTokens: lineage.expectedCached },
+      estimate: { maxPings, pingUsd, maxUsd: maxPings == null ? null : maxPings * pingUsd, perDayPings, perDayUsd: perDayPings * pingUsd, saveUsd: keepSavingUsd(lineage.expectedCached, { model: lineage.model, ttl: lineage.ttl, cfg: this.cfg }), contextTokens: lineage.expectedCached },
     };
   }
 
@@ -838,7 +844,7 @@ export class KeepaliveStore {
   maybeStartPinPlan(session, now = this.now()) {
     const pin = session.pin;
     if (!pin) return null;
-    if (now >= pin.untilAt) {
+    if (pin.untilAt != null && now >= pin.untilAt) {
       this.unpinSession(session, { source: 'scheduler', reason: '长保活到期', action: 'expired' });
       return null;
     }
@@ -873,9 +879,20 @@ export class KeepaliveStore {
     }
     if (!lineage.snapshot || lineage.expectedCached <= 0) return null;
     if (lineage.ttlDowngraded) return null;
-    const count = Math.max(1, Math.ceil((pin.untilAt - now) / (interval * 1000)));
+    // 任务进程已退出 / 任务已关闭：这段空闲没人会回来，不发；要回来得先 resume，那时再接上。每段只记一次
+    const agent = this.agentLookup(session);
+    if ((this.cfg.pin?.skipClosedAgents ?? true) && ['closed', 'error'].includes(agent?.status)) {
+      if (lineage.pinClosedIdleAt !== lineage.lastRealStartAt) {
+        lineage.pinClosedIdleAt = lineage.lastRealStartAt;
+        this.appendEvent({ t: 'pin', at: now, sid: session.id, action: 'agent-closed', untilAt: pin.untilAt, idleStartAt: lineage.lastRealStartAt, cwd: session.cwd });
+        this.scheduleSave();
+      }
+      return null;
+    }
+    // 次数：到期前每隔 interval 一次；长期保活没有上限（count=null），直到人回来 / 未命中 / 每日额度
+    const count = pin.untilAt == null ? null : Math.max(1, Math.ceil((pin.untilAt - now) / (interval * 1000)));
     const plan = this.createPlan(session, lineage, { count, intervalSec: interval, source: 'pin', now, extra: { trigger: 'pin', pinUntilAt: pin.untilAt } });
-    this.log(`pin plan session=${session.id.slice(0, 8)} count=${count} until=${new Date(pin.untilAt).toISOString()} context=${lineage.expectedCached}`);
+    this.log(`pin plan session=${session.id.slice(0, 8)} count=${count ?? 'unbounded'} until=${pin.untilAt == null ? 'forever' : new Date(pin.untilAt).toISOString()} context=${lineage.expectedCached}`);
     return plan;
   }
 
@@ -1051,7 +1068,7 @@ export class KeepaliveStore {
       reason: plan.reason,
       count: plan.count,
       done: plan.done,
-      remaining: Math.max(0, plan.count - plan.done),
+      remaining: plan.count == null ? null : Math.max(0, plan.count - plan.done),
       intervalSec: plan.intervalSec,
       forced: plan.forced,
       createdAt: plan.createdAt,
@@ -1234,7 +1251,7 @@ export class KeepaliveStore {
         const pinnedSession = this.sessions.get(lineage.sessionId);
         if (plan.source === 'pin' && pinnedSession?.pin) this.unpinSession(pinnedSession, { source: 'guard', reason: '心跳产生输出（上游没遵守 max_tokens），取消长保活', action: 'cancelled' });
       }
-      else if (plan.done >= plan.count) this.finishPlan(plan, 'completed', `已完成 ${plan.done} 次心跳`);
+      else if (plan.count != null && plan.done >= plan.count) this.finishPlan(plan, 'completed', `已完成 ${plan.done} 次心跳`);
     } else if (outcome === 'miss' || outcome === 'rewrite') {
       // 真实会话里 Claude Code 的系统与工具前缀常被其他会话保活，会话自己的缓存没了时
       // 表现为「读到共享前缀 + 大量重写」而不是 cache_read=0：两者同样锁定，再发只会反复重写。

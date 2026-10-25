@@ -565,3 +565,17 @@ test('pin --global / unpin --global：打印新设、延长、跳过与每个会
   assert.equal(r2.find(item => item.path === '/keepalive/api/sessions/pin').body.enabled, false);
   assert.match(result.stdout, /已取消 3 个会话的长保活/);
 });
+
+
+test('pin --forever：发 forever 标志，打印长期与按天的上界；--forever 与 --for 互斥', async t => {
+  const { url, requests } = await startMock(t, {
+    pinResponse: { ok: true, enabled: true, results: [{ ok: true, sessionId: SID_A, pin: { untilAt: null, forever: true, durationSec: null, intervalSec: 3000 }, estimate: { maxPings: null, maxUsd: null, perDayPings: 29, perDayUsd: 3.77, pingUsd: 0.13, saveUsd: 4.7, contextTokens: 520000 }, warnings: [] }] },
+  });
+  const result = await cli(url, 'pin', '--forever', '--session', SID_A.slice(0, 8));
+  assert.equal(result.code, 0, result.stderr);
+  const body = requests.find(item => item.path === '/keepalive/api/sessions/pin').body;
+  assert.equal(body.forever, true);
+  assert.match(result.stdout, /长期保活（没有到期时刻，直到 cache-keepalive unpin \/ stop）/);
+  const bad = await cli(url, 'pin', '--forever', '--for', '2h');
+  assert.notEqual(bad.code, 0);
+});
