@@ -761,7 +761,9 @@ export class KeepaliveStore {
     const pin = session.pin;
     if (!pin) return null;
     const plan = this.activePlanFor(session.id);
-    return { ...pin, forever: pin.untilAt == null, remainingSec: pin.untilAt == null ? null : Math.max(0, Math.round((pin.untilAt - now) / 1000)), active: plan?.source === 'pin', planId: plan?.source === 'pin' ? plan.id : null };
+    // 旧版设的长期保活没有 idleMaxPings，按当前配置显示（调度也按同样的回退取值）
+    const idleMaxPings = pin.untilAt == null ? (pin.idleMaxPings || Number(this.cfg.pin?.idleMaxPings) || 30) : null;
+    return { ...pin, idleMaxPings, forever: pin.untilAt == null, remainingSec: pin.untilAt == null ? null : Math.max(0, Math.round((pin.untilAt - now) / 1000)), active: plan?.source === 'pin', planId: plan?.source === 'pin' ? plan.id : null };
   }
 
   pinSession(session, { forSec = null, intervalSec = null, idleMaxPings = null, source = 'api', reason = null } = {}) {
