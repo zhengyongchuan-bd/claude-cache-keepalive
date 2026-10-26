@@ -764,7 +764,7 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
     const enabled = input.enabled === undefined ? true : truthy(input.enabled);
     const chosen = input.session || input.agent || truthy(input.all) ? matches : matches.slice(0, 1);
     const results = chosen.map(session => (enabled
-      ? store.pinSession(session, { forSec: truthy(input.forever) ? 'forever' : input.for ?? input.forSec, intervalSec: input.interval ?? input.intervalSec, source: input.source || 'api', reason: input.reason || null })
+      ? store.pinSession(session, { forSec: truthy(input.forever) ? 'forever' : input.for ?? input.forSec, intervalSec: input.interval ?? input.intervalSec, idleMaxPings: input.idleMaxPings ?? input.count ?? null, source: input.source || 'api', reason: input.reason || null })
       : store.unpinSession(session, { source: input.source || 'api', reason: input.reason || '取消长保活' })));
     tick();
     for (const result of results) {
@@ -806,7 +806,7 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
         continue;
       }
       const had = Boolean(session.pin);
-      const result = store.pinSession(session, { forSec: truthy(input.forever) ? 'forever' : input.for ?? input.forSec, intervalSec: input.interval ?? input.intervalSec, source: input.source || 'api', reason: input.reason || null });
+      const result = store.pinSession(session, { forSec: truthy(input.forever) ? 'forever' : input.for ?? input.forSec, intervalSec: input.interval ?? input.intervalSec, idleMaxPings: input.idleMaxPings ?? input.count ?? null, source: input.source || 'api', reason: input.reason || null });
       if (!result.ok) {
         summary.skipped += 1;
         const code = result.errors?.[0]?.code || 'unknown';

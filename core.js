@@ -43,7 +43,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   // 长保活（pin）：给某个会话设一个到期时刻，期间每段空闲都按间隔发心跳直到到期，不受自动保活门槛与每段次数限制；
   // 仍受硬护栏约束：会话活跃时不发、缓存已过期不发、未命中即锁定并取消、每日额度、Paseo 归档即取消
   // skipClosedAgents：任务进程已退出 / 任务已关闭的空闲段不发（没人会回来，要回来得先 resume，那时接上）
-  pin: { defaultSec: 12 * 3600, maxSec: 48 * 3600, skipClosedAgents: true },
+  // idleMaxPings：长期保活每段空闲最多发多少次（默认 30 次 ≈ 25 小时没人回来就停这段，下一次请求后接上）；pin --forever --count N 可按会话改
+  pin: { defaultSec: 12 * 3600, maxSec: 48 * 3600, skipClosedAgents: true, idleMaxPings: 30 },
   // 真实请求失败（如 529）后客户端会立刻重试：这段时间会话算活跃，不发心跳
   requestRetryGraceSec: 90,
   // 会话对应的任务还在不在（自动保活「任务已关闭」门槛）：process = 扫 /proc 里的 Claude Code 进程（按 --resume 会话 ID 或工作区匹配，

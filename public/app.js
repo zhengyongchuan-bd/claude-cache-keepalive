@@ -600,7 +600,7 @@ function sessionRow(view, stats) {
     planCell.append(h('div', { class: 'auto-line' }, statusEl(spec, `自动：${spec.label}`), detail ? h('span', { class: 'small muted' }, ` ${detail}`) : null));
   }
   if (view.pin) {
-    const until = view.pin.untilAt == null ? '长期（直到取消）' : `到 ${new Date(view.pin.untilAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })} · 剩 ${fmtDuration(view.pin.remainingSec)}`;
+    const until = view.pin.untilAt == null ? `长期（直到取消，每段空闲最多 ${view.pin.idleMaxPings ?? '-'} 次）` : `到 ${new Date(view.pin.untilAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })} · 剩 ${fmtDuration(view.pin.remainingSec)}`;
     planCell.append(h('div', { class: 'auto-line' }, statusEl({ cls: 'good', ico: '📌' }, '长保活'), h('span', { class: 'small muted' }, ` ${until} · 每 ${fmtInterval(view.pin.intervalSec)} · 只在空闲时发`)));
   }
   const plan = view.plan;
@@ -698,7 +698,7 @@ function actionsCell(view) {
       return;
     }
     const e = item.estimate;
-    const bound = e.maxPings == null ? `整天空闲约 ${e.perDayPings} 次 ${fmtUsd(e.perDayUsd)}/天` : `整段都空闲最多 ${e.maxPings} 次 ${fmtUsd(e.maxUsd)}`;
+    const bound = e.idleMaxPings != null ? `每段空闲最多 ${e.idleMaxPings} 次 ${fmtUsd(e.maxUsd)}，满了停到下一次请求` : e.maxPings == null ? `整天空闲约 ${e.perDayPings} 次 ${fmtUsd(e.perDayUsd)}/天` : `整段都空闲最多 ${e.maxPings} 次 ${fmtUsd(e.maxUsd)}`;
     const until = item.pin.untilAt == null ? '长期保活（直到取消）' : `长保活到 ${new Date(item.pin.untilAt).toLocaleString('zh-CN', { hour12: false })}`;
     toast(`已设${until}：只在空闲时每 ${fmtInterval(item.pin.intervalSec)} 一次，${bound}；人在工作时不发${item.warnings?.length ? `\n${item.warnings.join('\n')}` : ''}`);
   };
@@ -707,7 +707,8 @@ function actionsCell(view) {
     await doPin({ for: `${hours}h` });
   });
   const pinForever = run('长期保活', async () => {
-    if (!window.confirm('长期保活没有到期时刻，每段空闲都会一直心跳到人回来；未命中、任务进程退出、每日额度照常生效。确定？')) return;
+    const cap = state.health?.defaults?.pin?.idleMaxPings || 30;
+    if (!window.confirm(`长期保活没有到期时刻；每段空闲最多 ${cap} 次心跳（约 ${Math.round(cap * 50 / 60)} 小时没人回来就停这段，下一次请求后接上）；未命中、任务进程退出、每日额度照常生效。确定？`)) return;
     await doPin({ forever: true });
   });
   const unpin = run('取消长保活', async () => {
@@ -774,7 +775,7 @@ function renderEvents() {
     if (event.t === 'global') {
       what = h('span', {}, statusEl(event.action === 'off' ? { cls: 'critical', ico: '■' } : { cls: 'good', ico: '●' }, event.action === 'off' ? `保活全局关闭（停 ${event.stopped} 个计划、取消 ${event.unpinned} 个长保活）` : '保活全局打开'), event.reason ? ` · ${event.reason}` : '');
     } else if (event.t === 'pin') {
-      const label = { set: event.untilAt == null ? '设长期保活' : `设长保活到 ${fmtTime(event.untilAt)}`, extend: event.untilAt == null ? '长保活改为长期' : `延长长保活到 ${fmtTime(event.untilAt)}`, unset: '取消长保活', expired: '长保活到期', cancelled: '长保活取消', 'missed-window': '长保活：本段空闲已超安全窗口，等下一次请求', 'agent-closed': '长保活：任务进程已退出，本段空闲不发' }[event.action] || event.action;
+      const label = { set: event.untilAt == null ? '设长期保活' : `设长保活到 ${fmtTime(event.untilAt)}`, extend: event.untilAt == null ? '长保活改为长期' : `延长长保活到 ${fmtTime(event.untilAt)}`, unset: '取消长保活', expired: '长保活到期', cancelled: '长保活取消', 'missed-window': '长保活：本段空闲已超安全窗口，等下一次请求', 'agent-closed': '长保活：任务进程已退出，本段空闲不发', 'idle-cap': `长期保活：本段空闲已发满 ${event.done} 次上限，停到下一次请求` }[event.action] || event.action;
       what = h('span', {}, statusEl({ cls: event.action === 'set' || event.action === 'extend' ? 'good' : 'neutral', ico: '📌' }, label), ` ${sessionLabel(event.sid)}${event.reason ? ` · ${event.reason}` : ''}`);
     } else if (event.t === 'ping') {
       what = h('span', {}, statusEl(event.outcome, `${event.source === 'auto' ? '自动' : event.source === 'pin' ? '长保活' : ''}心跳${OUTCOME[event.outcome]?.label || event.outcome}`), ` ${sessionLabel(event.sid)} · 读 ${fmtTokens(event.usage?.cacheRead)}${event.usage?.cacheWrite ? ` · 写 ${fmtTokens(event.usage.cacheWrite)}` : ''}${event.error ? ` · ${event.error}` : ''}`);
@@ -896,7 +897,7 @@ function renderEpisodes() {
     h('td', {}, `${new Date(episode.startedAt).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })} ${fmtTime(episode.startedAt)}`),
     h('td', { title: `${episode.sessionId}\n${episode.cwd || ''}` }, h('div', {}, title.length > 36 ? `${title.slice(0, 36)}…` : title), h('div', { class: 'small muted' }, `${shortId(episode.sessionId)} · ${shortModel(episode.model)}${episode.ttl ? ` · ${episode.ttl}` : ''}`)),
     h('td', {}, `${SOURCE_LABEL[episode.source] || '手动'}${episode.trigger === 'tool-gap' ? '（工具空闲）' : ''}${episode.forced ? ' · 强制' : ''}`),
-    h('td', {}, h('div', {}, pingDots(episode)), h('div', { class: 'small muted' }, `${episode.pings.length}/${episode.count ?? (episode.source === 'pin' ? '∞' : '?')} 次 · 间隔 ${fmtInterval(episode.intervalSec || 0)}`)),
+    h('td', {}, h('div', {}, pingDots(episode)), h('div', { class: 'small muted' }, `${episode.pings.length}/${episode.count ?? '?'} 次 · 间隔 ${fmtInterval(episode.intervalSec || 0)}`)),
     h('td', { class: 'r' }, fmtUsd(-episode.pingCostUsd), episode.pingCostEstimatedUsd ? h('div', { class: 'small muted' }, `含估 ${fmtUsd(episode.pingCostEstimatedUsd)}`) : null),
     h('td', { class: 'r', title: '这段前缀保住后、人按时回来能省的整段重写费' }, episode.expectedSaveUsd != null ? fmtUsd(episode.expectedSaveUsd) : '—', episode.contextTokens ? h('div', { class: 'small muted' }, `${fmtTokens(episode.contextTokens)} tokens`) : null),
     h('td', {}, statusEl(spec), resumeText ? h('div', { class: 'small muted' }, resumeText) : null),

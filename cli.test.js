@@ -570,14 +570,18 @@ test('pin --global / unpin --global：打印新设、延长、跳过与每个会
 
 test('pin --forever：发 forever 标志，打印长期与按天的上界；--forever 与 --for 互斥', async t => {
   const { url, requests } = await startMock(t, {
-    pinResponse: { ok: true, enabled: true, results: [{ ok: true, sessionId: SID_A, pin: { untilAt: null, forever: true, durationSec: null, intervalSec: 3000 }, estimate: { maxPings: null, maxUsd: null, perDayPings: 29, perDayUsd: 3.77, pingUsd: 0.13, saveUsd: 4.7, contextTokens: 520000 }, warnings: [] }] },
+    pinResponse: { ok: true, enabled: true, results: [{ ok: true, sessionId: SID_A, pin: { untilAt: null, forever: true, durationSec: null, intervalSec: 3000, idleMaxPings: 30 }, estimate: { maxPings: 30, maxUsd: 3.9, idleMaxPings: 30, perDayPings: 29, perDayUsd: 3.77, pingUsd: 0.13, saveUsd: 4.7, contextTokens: 520000 }, warnings: [] }] },
   });
   const result = await cli(url, 'pin', '--forever', '--session', SID_A.slice(0, 8));
   assert.equal(result.code, 0, result.stderr);
   const body = requests.find(item => item.path === '/keepalive/api/sessions/pin').body;
   assert.equal(body.forever, true);
   assert.match(result.stdout, /长期保活（没有到期时刻，直到 cache-keepalive unpin \/ stop）/);
-  assert.match(result.stdout, /整天都空闲约 29 次 \$3\.77\/天/);
+  assert.match(result.stdout, /每段空闲最多 30 次（约 25h 没人回来就停这段/);
+  assert.match(result.stdout, /每段空闲最多 30 次 \$3\.90/);
+  const withCount = await cli(url, 'pin', '--forever', '--count', '12', '--session', SID_A.slice(0, 8));
+  assert.equal(withCount.code, 0, withCount.stderr);
+  assert.equal(requests.filter(item => item.path === '/keepalive/api/sessions/pin').at(-1).body.count, '12');
   const bad = await cli(url, 'pin', '--forever', '--for', '2h');
   assert.notEqual(bad.code, 0);
 });

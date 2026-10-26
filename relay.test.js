@@ -1993,9 +1993,10 @@ test('长期保活（--forever）：没有到期时刻，每段空闲不限次�
   assert.equal(item.ok, true, JSON.stringify(res.json));
   assert.equal(item.pin.untilAt, null);
   assert.equal(item.pin.forever, true);
-  assert.equal(item.estimate.maxPings, null);
-  assert.ok(item.estimate.perDayPings >= 28 && item.estimate.perDayUsd > 0);
-  // 远超 48h 上限：仍在保活，每段空闲计划 count=null，不会「已完成」
+  assert.equal(item.estimate.maxPings, 30, '每段空闲上限 = pin.idleMaxPings 默认 30');
+  assert.equal(item.estimate.idleMaxPings, 30);
+  assert.ok(item.estimate.maxUsd > 0);
+  // 远超 48h 上限：仍在保活，每段空闲计划 count=30，20 次内不会「已完成」
   const before = upstream.requests.length;
   for (let i = 0; i < 20; i += 1) {
     clock.t += 50 * MIN;
@@ -2005,11 +2006,12 @@ test('长期保活（--forever）：没有到期时刻，每段空闲不限次�
   assert.equal(upstream.requests.length - before, 20, '每 50 分钟一次，连续 20 次都发');
   const plan = relay.store.activePlans()[0];
   assert.equal(plan.source, 'pin');
-  assert.equal(plan.count, null);
+  assert.equal(plan.count, 30);
   assert.equal(plan.done, 20);
   let view = (await control(relay, 'GET', `sessions?session=${SID}`)).json.sessions[0];
-  assert.equal(view.plan.remaining, null);
+  assert.equal(view.plan.remaining, 10);
   assert.equal(view.pin.remainingSec, null);
+  assert.equal(view.pin.idleMaxPings, 30);
   // 人回来：这段结束；进程退出后的空闲段不发，并只记一次事件
   await sendMessages(relay, ['hello', 'ok', 'back']);
   assert.equal(relay.store.activePlans().length, 0, '会话继续了，本段长保活结束');
@@ -2091,4 +2093,41 @@ test('按 Paseo 任务 ID 定位：支持 ≥6 位前缀，多个候选时列出
   // unpin / stop 也按任务
   const un = await control(relay, 'POST', 'sessions/pin', { agent: '15c60532-bbbb', enabled: false });
   assert.equal(un.json.results[0].changed, true);
+});
+
+
+test('长期保活每段空闲有次数上限：--count 3 发满即停这段（长保活仍在），下一次真实请求后新段重新计数；上限非法被拒', async t => {
+  const { clock, upstream, relay } = await setup(t, { auto: { mode: 'off' } });
+  await sendMessages(relay, ['hello']);
+  const bad = await control(relay, 'POST', 'sessions/pin', { session: SID, forever: true, count: 0 });
+  assert.equal(bad.json.results[0].ok, false);
+  assert.equal(bad.json.results[0].errors[0].code, 'bad-count');
+  const res = await control(relay, 'POST', 'sessions/pin', { session: SID, forever: true, count: 3 });
+  assert.equal(res.json.results[0].ok, true, JSON.stringify(res.json));
+  assert.equal(res.json.results[0].pin.idleMaxPings, 3);
+  assert.equal(res.json.results[0].estimate.maxPings, 3);
+  const before = upstream.requests.length;
+  for (let i = 0; i < 6; i += 1) {
+    clock.t += 50 * MIN;
+    relay.tick();
+    await relay.flush();
+  }
+  assert.equal(upstream.requests.length - before, 3, '发满 3 次后这段不再发');
+  assert.equal(relay.store.activePlans().length, 0);
+  assert.ok(relay.store.sessions.get(SID).pin, '长保活本身还在');
+  const capped = relay.store.recentEvents(50).filter(event => event.t === 'pin' && event.action === 'idle-cap');
+  assert.equal(capped.length, 1);
+  assert.equal(capped[0].done, 3);
+  const view = (await control(relay, 'GET', `sessions?session=${SID}`)).json.sessions[0];
+  assert.equal(view.plan.status, 'completed');
+  assert.match(view.plan.reason, /发满 3 次/);
+  // 人回来后新的空闲段重新计数
+  await sendMessages(relay, ['hello', 'ok', 'back']);
+  const again = upstream.requests.length;
+  for (let i = 0; i < 5; i += 1) {
+    clock.t += 50 * MIN;
+    relay.tick();
+    await relay.flush();
+  }
+  assert.equal(upstream.requests.length - again, 3, '新段又发 3 次');
 });
