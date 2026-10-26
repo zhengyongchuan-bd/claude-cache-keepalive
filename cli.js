@@ -51,7 +51,7 @@ const HELP = `用法: cache-keepalive [命令] [选项]      在任务的工作�
   stats                 成本 / 收益汇总（--days N；自动 / 手动 / 长保活分开）
   events                最近事件：心跳、回来、冷启动、计划、自动、长保活、总开关
   sessions              最近经过中继的全部会话（--hours N）
-  backtest              用本机会话记录回测自动保活（--grid 参数对比，--session ID 明细）
+  backtest              用本机会话记录回测自动保活（--grid 参数对比，--session ID 明细；--gateway 3h / --gateway-grid 按网关内置保活规则回测）
   web                   打印页面地址
 
 运维:
@@ -108,6 +108,9 @@ function parseArgs(argv) {
     else if (value === '--for' || value === '--duration') opts.for = next();
     else if (value === '--hours') opts.hours = next();
     else if (value === '--pings') opts.pings = next();
+    else if (value === '--gateway') opts.gateway = next();
+    else if (value === '--gateway-grid') opts.gatewayGrid = true;
+    else if (value === '--late-rate') opts.lateRate = next();
     else if (value === '--usd') opts.usd = next();
     else if (value === '--active') opts.active = true;
     else if (value === '--warm') opts.warm = true;
@@ -779,6 +782,9 @@ async function backtestCommand(opts) {
   if (opts.minTurns != null) args.push('--min-turns', String(opts.minTurns));
   if (opts.quiet != null) args.push('--quiet', String(opts.quiet));
   if (opts.grid) args.push('--grid');
+  if (opts.gateway != null) args.push('--gateway', String(opts.gateway));
+  if (opts.gatewayGrid) args.push('--gateway-grid');
+  if (opts.lateRate != null) args.push('--late-rate', String(opts.lateRate));
   if (opts.session) args.push('--session', opts.session);
   if (opts.json) args.push('--json');
   execFileSync(process.execPath, args, { stdio: 'inherit' });

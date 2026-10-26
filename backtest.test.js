@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DEFAULT_CONFIG, mergeConfig } from './core.js';
-import { discoverRoots, loadSessions, readTranscript, runBacktest, simulateSession } from './backtest.js';
+import { discoverRoots, gatewayBudget, gatewayVariants, loadSessions, parseSpan, readTranscript, runBacktest, simulateSession } from './backtest.js';
 
 const MIN = 60 * 1000;
 const T0 = new Date(2026, 9, 21, 10, 0).getTime();
@@ -99,4 +99,47 @@ test('readTranscript / loadSessions：只读主对话（跳过子代理目录与
   assert.equal(result.totals.pings, 0, '前缀太小，不发心跳');
   assert.equal(simulated[0][0].decision, 'small-context');
   assert.equal(simulated[0][0].returnKind, 'compact');
+});
+
+
+test('网关版规则回测：span 决定每段次数（3h→3、12h→12、24h→封顶 19）；工具调用回合不回来发满 19 次；停在用户处 span=0 不保活；59.5 分钟一次', () => {
+  assert.equal(gatewayBudget({ spanSec: 0 }), 19);
+  assert.equal(gatewayBudget({ spanSec: 3 * 3600 }), 3);
+  assert.equal(gatewayBudget({ spanSec: 12 * 3600 }), 12);
+  assert.equal(gatewayBudget({ spanSec: 24 * 3600 }), 19);
+  assert.equal(gatewayBudget({ spanSec: 30 * 60 }), 0, 'span 短于 59.5 分钟不安排');
+  assert.equal(parseSpan('3h'), 10800);
+  assert.equal(parseSpan('90m'), 5400);
+  assert.equal(parseSpan('0'), 0);
+  const now = T0 + 48 * 60 * MIN;
+  const gone = simulateSession(session([call(T0, { stop: 'tool_use' })]), { cfg, now, policy: { kind: 'gateway', spanSec: 0 } })[0];
+  assert.equal(gone.decision, 'tool-gap');
+  assert.equal(gone.pings, 19, '工具调用回合没人回来：发满回本上限');
+  assert.ok(gone.lateRiskUsd > 0);
+  const idle0 = simulateSession(session([call(T0)]), { cfg, now, policy: { kind: 'gateway', spanSec: 0 } })[0];
+  assert.equal(idle0.decision, 'gw-not-tool-call');
+  assert.equal(idle0.pings, 0);
+  const idle3h = simulateSession(session([call(T0)]), { cfg, now, policy: { kind: 'gateway', spanSec: 3 * 3600 } })[0];
+  assert.equal(idle3h.decision, 'idle');
+  assert.equal(idle3h.pings, 3);
+  // 第一次在 59.5 分钟：58 分钟就回来的不算空闲段；2 小时回来 → 发了 2 次（59.5m、119m），保住
+  assert.ok(simulateSession(session([call(T0), call(T0 + 58 * MIN, { read: 302000 })]), { cfg, now, policy: { kind: 'gateway', spanSec: 3 * 3600 } }).every(gap => gap.at !== T0), '58 分钟就回来：第一段不算空闲段');
+  const back = simulateSession(session([call(T0), call(T0 + 120 * MIN, { read: 23000, write: 285000 })]), { cfg, now, policy: { kind: 'gateway', spanSec: 3 * 3600 } })[0];
+  assert.equal(back.pings, 2);
+  assert.equal(back.outcome, 'kept');
+  // 没有前缀 / 人工轮次 / 凌晨门槛
+  const night = new Date(2026, 9, 22, 2, 0).getTime();
+  assert.equal(simulateSession(session([call(night, { read: 50000 })], { humans: [] }), { cfg, now: night + 10 * 3600 * 1000, policy: { kind: 'gateway', spanSec: 3 * 3600 } })[0].pings, 3);
+  assert.equal(gatewayVariants()[0].policy, null);
+  assert.equal(gatewayVariants().length, 6);
+});
+
+test('runBacktest：variants 可各带 policy，中继规则与网关规则同一份数据对比', async () => {
+  const sessions = [session([call(T0, { stop: 'tool_use' })])];
+  const { result } = await runBacktest({ cfg, days: 7, now: T0 + 48 * 60 * MIN, sessions, variants: gatewayVariants(), policy: { kind: 'gateway', spanSec: 0 } });
+  assert.equal(result.policy.kind, 'gateway');
+  assert.equal(result.totals.pings, 19);
+  const relay = result.variants.find(v => v.label === '中继：当前规则');
+  assert.equal(relay.totals.pings, cfg.auto.count, '中继按每段次数');
+  assert.equal(result.variants.find(v => v.label.startsWith('网关 span=3h')).totals.pings, 3, 'span 也封顶工具调用回合的安排');
 });

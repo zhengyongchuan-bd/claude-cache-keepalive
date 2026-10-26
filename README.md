@@ -125,7 +125,7 @@ cache-keepalive web                     # 页面地址：http://127.0.0.1:18110/
 | `stats [--days 7]` | 成本 / 收益汇总，自动 / 手动 / 长保活分开 |
 | `events` | 最近事件：心跳、回来、冷启动、计划、自动、长保活、总开关 |
 | `sessions [--hours 24]` | 最近经过中继的全部会话 |
-| `backtest [--grid] [--session ID]` | 用本机会话记录回测自动保活 |
+| `backtest [--grid] [--session ID]` | 用本机会话记录回测自动保活；`--gateway 0|3h|12h` / `--gateway-grid [--late-rate 0.04]` 按上游网关内置保活规则（到期前 30s 重发、span 封顶、无门槛）回测并对比 |
 | `web` | 打印页面地址（`http://127.0.0.1:18110/keepalive/`） |
 
 ### 运维

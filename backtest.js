@@ -196,9 +196,30 @@ function countUpTo(sorted, t) {
 // 一个会话按线上规则重放：每次主对话请求之后的空闲，到第一次心跳的时刻按 autoEligibility 决定是否保活，
 // 之后每隔 interval 发一次，直到用户回来、次数用完或回测截止。
 // 心跳一律按命中计（真实命中率见 stats）；回来时是否省钱看真实数据里那次请求有没有整段重写。
-export function simulateSession(session, { cfg = DEFAULT_CONFIG, now = Date.now(), since = 0 } = {}) {
+// 上游网关内置规则（live setting claude_prompt_cache_keepalive）：到期前 lead 秒重发一次，之后每隔「寿命−lead」一次；
+// 停在工具调用的回合一律保活（上限 19 次），停在用户处的主线程回合只在 span > 0 时保活，且所有安排不晚于 span。
+// 没有前缀大小、人工轮次、凌晨、进程状态等门槛。
+export const GATEWAY_BREAK_EVEN_1H = 19;
+export const GATEWAY_LEAD_SEC = 30;
+export function gatewayBudget({ spanSec = 0, lifetimeSec = TTL_SEC['1h'], leadSec = GATEWAY_LEAD_SEC, budget = GATEWAY_BREAK_EVEN_1H } = {}) {
+  const after = lifetimeSec - leadSec;
+  if (spanSec <= 0) return budget;
+  if (after > spanSec) return 0;
+  return Math.min(budget, 1 + Math.floor((spanSec - after) / lifetimeSec));
+}
+
+export const GATEWAY_SKIP_LABELS = {
+  'gw-not-tool-call': '停在用户处的回合（span=0 不保活）',
+  'gw-span-too-short': 'span 短于首次保活时刻（59.5 分钟），不安排',
+  'gw-not-1h': '不是 1h 缓存',
+};
+
+export function simulateSession(session, { cfg = DEFAULT_CONFIG, now = Date.now(), since = 0, policy = null } = {}) {
   const ttlMs = TTL_SEC['1h'] * 1000;
   const settings = ttlSettings('1h', cfg);
+  const gateway = policy?.kind === 'gateway' ? { spanSec: Number(policy.spanSec) || 0, leadSec: Number(policy.leadSec) || GATEWAY_LEAD_SEC } : null;
+  // 网关版的第一次心跳在 59.5 分钟，之后每 59.5 分钟一次；中继是 50 分钟
+  const stepMs = gateway ? (TTL_SEC['1h'] - gateway.leadSec) * 1000 : settings.intervalSec * 1000;
   const gaps = [];
   let ttl = '1h';
   for (let i = 0; i < session.calls.length; i += 1) {
@@ -211,7 +232,7 @@ export function simulateSession(session, { cfg = DEFAULT_CONFIG, now = Date.now(
     const compactAt = session.compactions.find(t => t > prev.t && (!next || t <= next.t)) ?? null;
     const returnAt = compactAt ?? next?.t ?? null;
     const returnKind = compactAt ? 'compact' : next ? 'request' : 'none';
-    const firstAt = prev.t + settings.intervalSec * 1000;
+    const firstAt = prev.t + stepMs;
     // 第一次心跳之前用户就回来了（正常工作节奏）：不涉及保活
     if (returnAt != null && returnAt <= firstAt) continue;
     if (now < firstAt) continue;
@@ -225,12 +246,20 @@ export function simulateSession(session, { cfg = DEFAULT_CONFIG, now = Date.now(
       stopReason: prev.stop,
       idleStartAt: prev.t,
     };
-    const decision = autoEligibility(features, { now: firstAt, cfg });
+    let decision;
+    if (gateway) {
+      if (ttl !== '1h') decision = { ok: false, code: 'gw-not-1h' };
+      else if (prev.stop !== 'tool_use' && gateway.spanSec <= 0) decision = { ok: false, code: 'gw-not-tool-call' };
+      else {
+        const count = gatewayBudget({ spanSec: gateway.spanSec, leadSec: gateway.leadSec });
+        decision = count > 0 ? { ok: true, code: prev.stop === 'tool_use' ? 'tool-gap' : 'idle', count } : { ok: false, code: 'gw-span-too-short' };
+      }
+    } else decision = autoEligibility(features, { now: firstAt, cfg });
     const pings = [];
     let end = 'count';
     if (decision.ok) {
       for (let k = 1; k <= decision.count; k += 1) {
-        const at = prev.t + k * settings.intervalSec * 1000;
+        const at = prev.t + k * stepMs;
         if (returnAt != null && at >= returnAt) {
           end = 'returned';
           break;
@@ -256,8 +285,11 @@ export function simulateSession(session, { cfg = DEFAULT_CONFIG, now = Date.now(
     }
     const lastPing = pings[pings.length - 1] ?? null;
     const kept = Boolean(lastPing && returnAt != null && gapSec > TTL_SEC['1h'] && returnAt - lastPing <= ttlMs);
-    const readPrice = priceFor(prev.model, cfg, prevCached).cacheRead;
+    const prices = priceFor(prev.model, cfg, prevCached);
+    const readPrice = prices.cacheRead;
     const benefitUsd = kept && cold ? Math.max(0, cold.rewriteUsd - cold.rewriteTokens * readPrice / 1e6) : 0;
+    // 网关版提前量只有 30s：心跳延迟超过它就落在过期之后，变成整段 1h 重写；按每次心跳记下这笔潜在代价
+    const lateRewriteUsd = gateway ? prevCached * (prices.write1h ?? prices.write5m) / 1e6 : 0;
     let outcome;
     if (!decision.ok) outcome = cold ? 'missed' : 'skipped';
     else if (!pings.length) outcome = cold ? 'missed' : 'skipped';
@@ -277,6 +309,7 @@ export function simulateSession(session, { cfg = DEFAULT_CONFIG, now = Date.now(
       decision: decision.ok ? decision.code : decision.code,
       pings: pings.length,
       pingUsd,
+      lateRiskUsd: pings.length * lateRewriteUsd,
       coldUsd: cold?.rewriteUsd || 0,
       benefitUsd,
       outcome,
@@ -314,6 +347,7 @@ export function summarize(sessions, simulated) {
       totals.outcomes[gap.outcome] = (totals.outcomes[gap.outcome] || 0) + 1;
       totals.pings += gap.pings;
       totals.pingUsd += gap.pingUsd;
+      totals.lateRiskUsd = (totals.lateRiskUsd || 0) + (gap.lateRiskUsd || 0);
       row.pings += gap.pings;
       row.pingUsd += gap.pingUsd;
       if (gap.coldUsd) {
@@ -351,20 +385,20 @@ export function summarize(sessions, simulated) {
   return { totals, sessions: rows };
 }
 
-export async function runBacktest({ cfg = DEFAULT_CONFIG, days = 7, now = Date.now(), roots, sessions = null, variants = null } = {}) {
+export async function runBacktest({ cfg = DEFAULT_CONFIG, days = 7, now = Date.now(), roots, sessions = null, variants = null, policy = null } = {}) {
   const since = now - days * DAY_MS;
   const loaded = sessions || await loadSessions({ roots, cfg });
-  const run = variantCfg => {
-    const simulated = loaded.map(session => simulateSession(session, { cfg: variantCfg, now, since }));
+  const run = (variantCfg, variantPolicy = policy) => {
+    const simulated = loaded.map(session => simulateSession(session, { cfg: variantCfg, now, since, policy: variantPolicy }));
     return { simulated, ...summarize(loaded, simulated) };
   };
   const main = run(cfg);
-  const out = { days, since, now, auto: cfg.auto, totals: main.totals, sessions: main.sessions };
+  const out = { days, since, now, auto: cfg.auto, policy, totals: main.totals, sessions: main.sessions };
   if (variants) {
     out.variants = variants.map(variant => {
-      const variantCfg = mergeConfig(cfg, { auto: variant.auto });
-      const { totals } = run(variantCfg);
-      return { label: variant.label, auto: variantCfg.auto, totals };
+      const variantCfg = variant.auto ? mergeConfig(cfg, { auto: variant.auto }) : cfg;
+      const { totals } = run(variantCfg, variant.policy === undefined ? policy : variant.policy);
+      return { label: variant.label, auto: variantCfg.auto, policy: variant.policy === undefined ? policy : variant.policy, totals };
     });
   }
   return { result: out, loaded, simulated: main.simulated };
@@ -382,6 +416,15 @@ export function defaultVariants() {
   return variants;
 }
 
+// 网关版各 span 的对比，再放一行中继当前规则作参照
+export function gatewayVariants() {
+  const variants = [{ label: '中继：当前规则', policy: null }];
+  for (const hours of [0, 3, 6, 12, 24]) {
+    variants.push({ label: hours ? `网关 span=${hours}h` : '网关 span=0（只保活工具调用）', policy: { kind: 'gateway', spanSec: hours * 3600 } });
+  }
+  return variants;
+}
+
 // ------------------------------------------------------------------ 命令行
 
 function parseArgs(argv) {
@@ -396,12 +439,23 @@ function parseArgs(argv) {
     else if (value === '--quiet') args.auto.quietHours = parseQuiet(next());
     else if (value === '--auto') Object.assign(args.auto, JSON.parse(next()));
     else if (value === '--grid') args.grid = true;
+    else if (value === '--gateway') args.gateway = next();
+    else if (value === '--gateway-grid') args.gatewayGrid = true;
+    else if (value === '--late-rate') args.lateRate = Number(next());
     else if (value === '--json') args.json = true;
     else if (value === '--session') args.session = next();
     else if (value === '--help' || value === '-h') args.help = true;
     else throw new Error(`未知参数: ${value}`);
   }
   return args;
+}
+
+export function parseSpan(value) {
+  const text = String(value).trim().toLowerCase();
+  if (text === '0' || text === 'off') return 0;
+  const m = text.match(/^(\d+(?:\.\d+)?)(h|m)?$/);
+  if (!m) throw new Error(`无法解析 span: ${value}（例如 0、3h、90m）`);
+  return Math.round(Number(m[1]) * (m[2] === 'm' ? 60 : 3600));
 }
 
 export function parseTokens(value) {
@@ -430,16 +484,21 @@ const OUTCOME_TEXT = {
   skipped: '没保活（之后也没重写）',
 };
 
-function printResult(result) {
+function printResult(result, { lateRate = 0 } = {}) {
   const t = result.totals;
   const a = result.auto;
-  console.log(`自动保活回测：最近 ${result.days} 天，${t.sessions} 个 1h 会话、${t.idleGaps} 段超过 ${Math.round(ttlSettings('1h').intervalSec / 60)} 分钟的空闲`);
-  console.log(`  规则：每段空闲最多 ${a.count} 次；前缀 ≥ ${Math.round(a.minContextTokens / 1000)}K；人工接入 ≥ ${a.minHumanTurns} 轮${a.toolGapIgnoresTurns !== false ? '（工具执行中不看）' : ''}；${a.quietHours?.[0] === a.quietHours?.[1] ? '不设凌晨时段' : `${a.quietHours[0]}–${a.quietHours[1]} 点开始的空闲不保活`}`);
+  const gw = result.policy?.kind === 'gateway' ? result.policy : null;
+  console.log(`${gw ? '网关版保活规则' : '自动保活'}回测：最近 ${result.days} 天，${t.sessions} 个 1h 会话、${t.idleGaps} 段超过 ${gw ? '59.5' : Math.round(ttlSettings('1h').intervalSec / 60)} 分钟的空闲`);
+  if (gw) {
+    const budget = gatewayBudget({ spanSec: gw.spanSec });
+    console.log(`  规则：到期前 30s 重发（第 59.5 分钟），之后每 59.5 分钟一次；工具调用回合一律保活；停在用户处的主线程回合 ${gw.spanSec > 0 ? `span=${gw.spanSec / 3600}h → 每段最多 ${budget} 次` : '不保活（span=0）'}；没有前缀 / 人工轮次 / 凌晨 / 进程门槛`);
+    if (lateRate > 0) console.log(`  提前量风险：按实测 ${Math.round(lateRate * 1000) / 10}% 的心跳延迟超过 30s 计，这些心跳会落在过期之后变成整段重写，期望额外成本 ${usd((t.lateRiskUsd || 0) * lateRate)}`);
+  } else console.log(`  规则：每段空闲最多 ${a.count} 次；前缀 ≥ ${Math.round(a.minContextTokens / 1000)}K；人工接入 ≥ ${a.minHumanTurns} 轮${a.toolGapIgnoresTurns !== false ? '（工具执行中不看）' : ''}；${a.quietHours?.[0] === a.quietHours?.[1] ? '不设凌晨时段' : `${a.quietHours[0]}–${a.quietHours[1]} 点开始的空闲不保活`}`);
   console.log(`  心跳 ${t.pings} 次 ${usd(t.pingUsd)}：有用 ${t.usefulPings} 次，白发 ${t.wastedPings} 次（${pct(t.wastedPings, t.pings)}，${usd(t.wastedUsd)}）`);
   console.log(`  救回 ${t.kept} 次整段重写，省 ${usd(t.benefitUsd)}；净收益 ${usd(t.netUsd)}${t.roi ? `，ROI ${t.roi.toFixed(1)}×` : ''}`);
   console.log(`  不保活时这些空闲一共整段重写 ${t.coldStarts} 次 ${usd(t.coldUsd)}；开了之后仍要重写 ${t.missed} 次 ${usd(t.missedUsd)}`);
   const reasons = Object.entries(t.missedByReason).sort((x, y) => y[1].usd - x[1].usd);
-  if (reasons.length) console.log(`  仍要重写的原因：${reasons.map(([code, v]) => `${code === 'coverage' ? '离开太久超出覆盖' : AUTO_SKIP_LABELS[code] || code} ${v.count} 次 ${usd(v.usd)}`).join('；')}`);
+  if (reasons.length) console.log(`  仍要重写的原因：${reasons.map(([code, v]) => `${code === 'coverage' ? '离开太久超出覆盖' : GATEWAY_SKIP_LABELS[code] || AUTO_SKIP_LABELS[code] || code} ${v.count} 次 ${usd(v.usd)}`).join('；')}`);
   console.log(`  空闲结局：${Object.entries(t.outcomes).map(([k, v]) => `${OUTCOME_TEXT[k] || k} ${v}`).join('，')}`);
 }
 
@@ -447,16 +506,19 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     console.log('用法: node cache-keepalive/backtest.js [--days 7] [--count 3] [--min-context 100k] [--min-turns 2] [--quiet 1-8|off] [--grid] [--session <ID 前缀>] [--json]');
+    console.log('      --gateway <span，如 0|3h|12h>  按上游网关内置规则（live setting claude_prompt_cache_keepalive）回测；--gateway-grid 对比各 span 与中继当前规则；--late-rate 0.08 心跳延迟超过 30s 的比例');
     return;
   }
   // 规则取 ~/.config/cache-keepalive/config.json（与中继一致），命令行参数覆盖
   const cfg = mergeConfig(loadConfig(), { auto: args.auto });
-  const { result, loaded, simulated } = await runBacktest({ cfg, days: args.days, variants: args.grid ? defaultVariants() : null });
+  const policy = args.gateway != null || args.gatewayGrid ? { kind: 'gateway', spanSec: args.gateway == null ? 0 : parseSpan(args.gateway) } : null;
+  const variants = args.gatewayGrid ? gatewayVariants() : args.grid ? defaultVariants() : null;
+  const { result, loaded, simulated } = await runBacktest({ cfg, days: args.days, variants, policy });
   if (args.json) {
     console.log(JSON.stringify({ ...result, labels: OUTCOME_TEXT }));
     return;
   }
-  printResult(result);
+  printResult(result, { lateRate: args.lateRate || 0 });
   if (args.session) {
     loaded.forEach((session, index) => {
       if (!session.sid.startsWith(args.session)) return;
@@ -469,11 +531,13 @@ async function main() {
     });
   }
   if (result.variants) {
-    console.log('\n参数对比（同一份数据、同一套决策逻辑）：');
-    console.log('  规则                         心跳   白发   心跳花费   救回   节省      净收益');
+    const late = args.lateRate || 0;
+    console.log(args.gatewayGrid ? '\n网关版各 span 与中继当前规则对比（同一份数据；网关版心跳按全部命中计，最后一列按实测延迟分布扣掉落在过期后的心跳）：' : '\n参数对比（同一份数据、同一套决策逻辑）：');
+    console.log(`  规则                         心跳   白发   心跳花费   救回   节省      净收益${args.gatewayGrid ? '   30s提前量风险   扣风险后净' : ''}`);
     for (const variant of result.variants) {
       const v = variant.totals;
-      console.log(`  ${variant.label.padEnd(22)} ${String(v.pings).padStart(6)} ${pct(v.wastedPings, v.pings).padStart(6)} ${usd(v.pingUsd).padStart(9)} ${String(v.kept).padStart(6)} ${usd(v.benefitUsd).padStart(9)} ${usd(v.netUsd).padStart(9)}`);
+      const risk = variant.policy?.kind === 'gateway' ? (v.lateRiskUsd || 0) * late : 0;
+      console.log(`  ${variant.label.padEnd(22)} ${String(v.pings).padStart(6)} ${pct(v.wastedPings, v.pings).padStart(6)} ${usd(v.pingUsd).padStart(9)} ${String(v.kept).padStart(6)} ${usd(v.benefitUsd).padStart(9)} ${usd(v.netUsd).padStart(9)}${args.gatewayGrid ? ` ${usd(-risk).padStart(14)} ${usd(v.netUsd - risk).padStart(11)}` : ''}`);
     }
   }
   if (!args.session) {
