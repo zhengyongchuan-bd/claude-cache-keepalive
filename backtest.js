@@ -17,6 +17,7 @@ import {
   autoEligibility,
   classifyUserContent,
   coldStartOpportunity,
+  inQuietHours,
   mergeConfig,
   pingCostEstimateUsd,
   priceFor,
@@ -198,27 +199,51 @@ function countUpTo(sorted, t) {
 // 心跳一律按命中计（真实命中率见 stats）；回来时是否省钱看真实数据里那次请求有没有整段重写。
 // 上游网关内置规则（live setting claude_prompt_cache_keepalive）：到期前 lead 秒重发一次，之后每隔「寿命−lead」一次；
 // 停在工具调用的回合一律保活（上限 19 次），停在用户处的主线程回合只在 span > 0 时保活，且所有安排不晚于 span。
-// 没有前缀大小、人工轮次、凌晨、进程状态等门槛。
+// 旧规则没有前缀大小、人工轮次、凌晨、进程状态等门槛；护栏版（policy.guards）加了提前量 5m、工具调用保活上限 2h、
+// 停在用户处的回合要求人工 ≥ 2 轮、前缀 ≥ 100K、可选静默时段。锁定与冷却回测不建模（心跳按全部命中计）。
 export const GATEWAY_BREAK_EVEN_1H = 19;
 export const GATEWAY_LEAD_SEC = 30;
-export function gatewayBudget({ spanSec = 0, lifetimeSec = TTL_SEC['1h'], leadSec = GATEWAY_LEAD_SEC, budget = GATEWAY_BREAK_EVEN_1H } = {}) {
+export const GATEWAY_GUARDS = { leadSec: 300, toolCallSpanSec: 2 * 3600, minHumanTurns: 2, minContextTokens: 100000, quietHours: [0, 0] };
+// 经网关实测 79 次 170K–520K 前缀的保活读取：p50 6.0s、p90 16.5s、p95 26.4s、p99 108s、最大 108s。
+// 提前量超过这个最大值时，落在过期之后的风险按 0 计；不超过时按 --late-rate 给的比例计。
+export const GATEWAY_MEASURED_MAX_PING_SEC = 108;
+export function gatewayBudget({ spanSec = 0, lifetimeSec = TTL_SEC['1h'], leadSec = GATEWAY_LEAD_SEC, budget = GATEWAY_BREAK_EVEN_1H, toolCallSpanSec = 0 } = {}) {
   const after = lifetimeSec - leadSec;
-  if (spanSec <= 0) return budget;
-  if (after > spanSec) return 0;
-  return Math.min(budget, 1 + Math.floor((spanSec - after) / lifetimeSec));
+  const cap = span => (after > span ? 0 : 1 + Math.floor((span - after) / lifetimeSec));
+  let n = budget;
+  if (toolCallSpanSec > 0) n = Math.min(n, cap(toolCallSpanSec));
+  if (spanSec > 0) n = Math.min(n, cap(spanSec));
+  return n;
+}
+
+export function gatewayPolicy(policy) {
+  if (policy?.kind !== 'gateway') return null;
+  const base = policy.guards ? GATEWAY_GUARDS : { leadSec: GATEWAY_LEAD_SEC, toolCallSpanSec: 0, minHumanTurns: 0, minContextTokens: 0, quietHours: [0, 0] };
+  return {
+    guards: Boolean(policy.guards),
+    spanSec: Number(policy.spanSec) || 0,
+    leadSec: Number(policy.leadSec) || base.leadSec,
+    toolCallSpanSec: policy.toolCallSpanSec != null ? Number(policy.toolCallSpanSec) : base.toolCallSpanSec,
+    minHumanTurns: policy.minHumanTurns != null ? Number(policy.minHumanTurns) : base.minHumanTurns,
+    minContextTokens: policy.minContextTokens != null ? Number(policy.minContextTokens) : base.minContextTokens,
+    quietHours: policy.quietHours ?? base.quietHours,
+  };
 }
 
 export const GATEWAY_SKIP_LABELS = {
   'gw-not-tool-call': '停在用户处的回合（span=0 不保活）',
-  'gw-span-too-short': 'span 短于首次保活时刻（59.5 分钟），不安排',
+  'gw-span-too-short': 'span 短于首次保活时刻，不安排',
   'gw-not-1h': '不是 1h 缓存',
+  'gw-few-human-turns': '人工轮次不足（护栏版）',
+  'gw-small-context': '前缀太小（护栏版）',
+  'gw-quiet-hours': '静默时段开始的空闲（护栏版）',
 };
 
 export function simulateSession(session, { cfg = DEFAULT_CONFIG, now = Date.now(), since = 0, policy = null } = {}) {
   const ttlMs = TTL_SEC['1h'] * 1000;
   const settings = ttlSettings('1h', cfg);
-  const gateway = policy?.kind === 'gateway' ? { spanSec: Number(policy.spanSec) || 0, leadSec: Number(policy.leadSec) || GATEWAY_LEAD_SEC } : null;
-  // 网关版的第一次心跳在 59.5 分钟，之后每 59.5 分钟一次；中继是 50 分钟
+  const gateway = gatewayPolicy(policy);
+  // 网关版的第一次心跳在「寿命−提前量」（旧规则 59.5 分钟、护栏版 55 分钟），之后每隔同样时长一次；中继是 50 分钟
   const stepMs = gateway ? (TTL_SEC['1h'] - gateway.leadSec) * 1000 : settings.intervalSec * 1000;
   const gaps = [];
   let ttl = '1h';
@@ -248,11 +273,15 @@ export function simulateSession(session, { cfg = DEFAULT_CONFIG, now = Date.now(
     };
     let decision;
     if (gateway) {
+      const tool = prev.stop === 'tool_use';
       if (ttl !== '1h') decision = { ok: false, code: 'gw-not-1h' };
-      else if (prev.stop !== 'tool_use' && gateway.spanSec <= 0) decision = { ok: false, code: 'gw-not-tool-call' };
+      else if (!tool && gateway.spanSec <= 0) decision = { ok: false, code: 'gw-not-tool-call' };
+      else if (!tool && features.humanTurns < gateway.minHumanTurns) decision = { ok: false, code: 'gw-few-human-turns' };
+      else if (!tool && prevCached > 0 && prevCached < gateway.minContextTokens) decision = { ok: false, code: 'gw-small-context' };
+      else if (!tool && inQuietHours(prev.t, gateway.quietHours)) decision = { ok: false, code: 'gw-quiet-hours' };
       else {
-        const count = gatewayBudget({ spanSec: gateway.spanSec, leadSec: gateway.leadSec });
-        decision = count > 0 ? { ok: true, code: prev.stop === 'tool_use' ? 'tool-gap' : 'idle', count } : { ok: false, code: 'gw-span-too-short' };
+        const count = gatewayBudget({ spanSec: gateway.spanSec, leadSec: gateway.leadSec, toolCallSpanSec: tool ? gateway.toolCallSpanSec : 0 });
+        decision = count > 0 ? { ok: true, code: tool ? 'tool-gap' : 'idle', count } : { ok: false, code: 'gw-span-too-short' };
       }
     } else decision = autoEligibility(features, { now: firstAt, cfg });
     const pings = [];
@@ -288,8 +317,8 @@ export function simulateSession(session, { cfg = DEFAULT_CONFIG, now = Date.now(
     const prices = priceFor(prev.model, cfg, prevCached);
     const readPrice = prices.cacheRead;
     const benefitUsd = kept && cold ? Math.max(0, cold.rewriteUsd - cold.rewriteTokens * readPrice / 1e6) : 0;
-    // 网关版提前量只有 30s：心跳延迟超过它就落在过期之后，变成整段 1h 重写；按每次心跳记下这笔潜在代价
-    const lateRewriteUsd = gateway ? prevCached * (prices.write1h ?? prices.write5m) / 1e6 : 0;
+    // 网关版心跳延迟超过提前量就落在过期之后，变成整段 1h 重写；提前量不超过实测最大延迟时按每次心跳记下这笔潜在代价
+    const lateRewriteUsd = gateway && gateway.leadSec <= GATEWAY_MEASURED_MAX_PING_SEC ? prevCached * (prices.write1h ?? prices.write5m) / 1e6 : 0;
     let outcome;
     if (!decision.ok) outcome = cold ? 'missed' : 'skipped';
     else if (!pings.length) outcome = cold ? 'missed' : 'skipped';
@@ -416,11 +445,14 @@ export function defaultVariants() {
   return variants;
 }
 
-// 网关版各 span 的对比，再放一行中继当前规则作参照
+// 网关版旧规则与护栏版各 span 的对比，再放一行中继当前规则作参照
 export function gatewayVariants() {
   const variants = [{ label: '中继：当前规则', policy: null }];
-  for (const hours of [0, 3, 6, 12, 24]) {
-    variants.push({ label: hours ? `网关 span=${hours}h` : '网关 span=0（只保活工具调用）', policy: { kind: 'gateway', spanSec: hours * 3600 } });
+  for (const guards of [false, true]) {
+    for (const hours of [0, 3, 6, 12, 24]) {
+      const name = guards ? '网关护栏版' : '网关旧规则';
+      variants.push({ label: hours ? `${name} span=${hours}h` : `${name} span=0`, policy: { kind: 'gateway', spanSec: hours * 3600, guards } });
+    }
   }
   return variants;
 }
@@ -441,6 +473,7 @@ function parseArgs(argv) {
     else if (value === '--grid') args.grid = true;
     else if (value === '--gateway') args.gateway = next();
     else if (value === '--gateway-grid') args.gatewayGrid = true;
+    else if (value === '--gateway-guards') args.gatewayGuards = true;
     else if (value === '--late-rate') args.lateRate = Number(next());
     else if (value === '--json') args.json = true;
     else if (value === '--session') args.session = next();
@@ -490,9 +523,12 @@ function printResult(result, { lateRate = 0 } = {}) {
   const gw = result.policy?.kind === 'gateway' ? result.policy : null;
   console.log(`${gw ? '网关版保活规则' : '自动保活'}回测：最近 ${result.days} 天，${t.sessions} 个 1h 会话、${t.idleGaps} 段超过 ${gw ? '59.5' : Math.round(ttlSettings('1h').intervalSec / 60)} 分钟的空闲`);
   if (gw) {
-    const budget = gatewayBudget({ spanSec: gw.spanSec });
-    console.log(`  规则：到期前 30s 重发（第 59.5 分钟），之后每 59.5 分钟一次；工具调用回合一律保活；停在用户处的主线程回合 ${gw.spanSec > 0 ? `span=${gw.spanSec / 3600}h → 每段最多 ${budget} 次` : '不保活（span=0）'}；没有前缀 / 人工轮次 / 凌晨 / 进程门槛`);
-    if (lateRate > 0) console.log(`  提前量风险：按实测 ${Math.round(lateRate * 1000) / 10}% 的心跳延迟超过 30s 计，这些心跳会落在过期之后变成整段重写，期望额外成本 ${usd((t.lateRiskUsd || 0) * lateRate)}`);
+    const g = gatewayPolicy(gw);
+    const stepMin = (TTL_SEC['1h'] - g.leadSec) / 60;
+    const budget = gatewayBudget({ spanSec: g.spanSec, leadSec: g.leadSec });
+    const toolBudget = gatewayBudget({ spanSec: g.spanSec, leadSec: g.leadSec, toolCallSpanSec: g.toolCallSpanSec });
+    console.log(`  规则${g.guards ? '（护栏版）' : '（旧规则）'}：到期前 ${g.leadSec}s 重发（第 ${stepMin} 分钟），之后每 ${stepMin} 分钟一次；工具调用回合保活最多 ${toolBudget} 次；停在用户处的主线程回合 ${g.spanSec > 0 ? `span=${g.spanSec / 3600}h → 每段最多 ${budget} 次` : '不保活（span=0）'}；${g.guards ? `人工 ≥ ${g.minHumanTurns} 轮、前缀 ≥ ${Math.round(g.minContextTokens / 1000)}K${g.quietHours[0] === g.quietHours[1] ? '' : `、${g.quietHours[0]}–${g.quietHours[1]} 点不保活`}` : '没有前缀 / 人工轮次 / 凌晨 / 进程门槛'}`);
+    if (lateRate > 0) console.log(`  提前量风险：按实测 ${Math.round(lateRate * 1000) / 10}% 的心跳延迟超过 30s 计，提前量 ${g.leadSec}s ${g.leadSec > GATEWAY_MEASURED_MAX_PING_SEC ? `已超过实测最大延迟 ${GATEWAY_MEASURED_MAX_PING_SEC}s，按无风险计` : `下这些心跳会落在过期之后变成整段重写，期望额外成本 ${usd((t.lateRiskUsd || 0) * lateRate)}`}`);
   } else console.log(`  规则：每段空闲最多 ${a.count} 次；前缀 ≥ ${Math.round(a.minContextTokens / 1000)}K；人工接入 ≥ ${a.minHumanTurns} 轮${a.toolGapIgnoresTurns !== false ? '（工具执行中不看）' : ''}；${a.quietHours?.[0] === a.quietHours?.[1] ? '不设凌晨时段' : `${a.quietHours[0]}–${a.quietHours[1]} 点开始的空闲不保活`}`);
   console.log(`  心跳 ${t.pings} 次 ${usd(t.pingUsd)}：有用 ${t.usefulPings} 次，白发 ${t.wastedPings} 次（${pct(t.wastedPings, t.pings)}，${usd(t.wastedUsd)}）`);
   console.log(`  救回 ${t.kept} 次整段重写，省 ${usd(t.benefitUsd)}；净收益 ${usd(t.netUsd)}${t.roi ? `，ROI ${t.roi.toFixed(1)}×` : ''}`);
@@ -506,12 +542,12 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     console.log('用法: node cache-keepalive/backtest.js [--days 7] [--count 3] [--min-context 100k] [--min-turns 2] [--quiet 1-8|off] [--grid] [--session <ID 前缀>] [--json]');
-    console.log('      --gateway <span，如 0|3h|12h>  按上游网关内置规则（live setting claude_prompt_cache_keepalive）回测；--gateway-grid 对比各 span 与中继当前规则；--late-rate 0.08 心跳延迟超过 30s 的比例');
+    console.log('      --gateway <span，如 0|3h|12h>  按上游网关内置规则（live setting claude_prompt_cache_keepalive）回测；--gateway-guards 用护栏版规则（提前量 5m、工具调用 2h、人工 ≥2、前缀 ≥100K）；--gateway-grid 对比新旧各 span 与中继当前规则；--late-rate 0.04 心跳延迟超过 30s 的比例');
     return;
   }
   // 规则取 ~/.config/cache-keepalive/config.json（与中继一致），命令行参数覆盖
   const cfg = mergeConfig(loadConfig(), { auto: args.auto });
-  const policy = args.gateway != null || args.gatewayGrid ? { kind: 'gateway', spanSec: args.gateway == null ? 0 : parseSpan(args.gateway) } : null;
+  const policy = args.gateway != null || args.gatewayGrid || args.gatewayGuards ? { kind: 'gateway', spanSec: args.gateway == null ? 0 : parseSpan(args.gateway), guards: Boolean(args.gatewayGuards) } : null;
   const variants = args.gatewayGrid ? gatewayVariants() : args.grid ? defaultVariants() : null;
   const { result, loaded, simulated } = await runBacktest({ cfg, days: args.days, variants, policy });
   if (args.json) {
@@ -532,8 +568,8 @@ async function main() {
   }
   if (result.variants) {
     const late = args.lateRate || 0;
-    console.log(args.gatewayGrid ? '\n网关版各 span 与中继当前规则对比（同一份数据；网关版心跳按全部命中计，最后一列按实测延迟分布扣掉落在过期后的心跳）：' : '\n参数对比（同一份数据、同一套决策逻辑）：');
-    console.log(`  规则                         心跳   白发   心跳花费   救回   节省      净收益${args.gatewayGrid ? '   30s提前量风险   扣风险后净' : ''}`);
+    console.log(args.gatewayGrid ? '\n网关版旧规则 / 护栏版各 span 与中继当前规则对比（同一份数据；网关版心跳按全部命中计，最后一列按实测延迟分布扣掉落在过期后的心跳，提前量超过实测最大延迟的按无风险计）：' : '\n参数对比（同一份数据、同一套决策逻辑）：');
+    console.log(`  规则                         心跳   白发   心跳花费   救回   节省      净收益${args.gatewayGrid ? '      提前量风险   扣风险后净' : ''}`);
     for (const variant of result.variants) {
       const v = variant.totals;
       const risk = variant.policy?.kind === 'gateway' ? (v.lateRiskUsd || 0) * late : 0;

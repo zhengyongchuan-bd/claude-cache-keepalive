@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DEFAULT_CONFIG, mergeConfig } from './core.js';
-import { discoverRoots, gatewayBudget, gatewayVariants, loadSessions, parseSpan, readTranscript, runBacktest, simulateSession } from './backtest.js';
+import { discoverRoots, gatewayBudget, gatewayPolicy, gatewayVariants, loadSessions, parseSpan, readTranscript, runBacktest, simulateSession } from './backtest.js';
 
 const MIN = 60 * 1000;
 const T0 = new Date(2026, 9, 21, 10, 0).getTime();
@@ -131,7 +131,7 @@ test('网关版规则回测：span 决定每段次数（3h→3、12h→12、24h�
   const night = new Date(2026, 9, 22, 2, 0).getTime();
   assert.equal(simulateSession(session([call(night, { read: 50000 })], { humans: [] }), { cfg, now: night + 10 * 3600 * 1000, policy: { kind: 'gateway', spanSec: 3 * 3600 } })[0].pings, 3);
   assert.equal(gatewayVariants()[0].policy, null);
-  assert.equal(gatewayVariants().length, 6);
+  assert.equal(gatewayVariants().length, 11);
 });
 
 test('runBacktest：variants 可各带 policy，中继规则与网关规则同一份数据对比', async () => {
@@ -141,5 +141,38 @@ test('runBacktest：variants 可各带 policy，中继规则与网关规则同�
   assert.equal(result.totals.pings, 19);
   const relay = result.variants.find(v => v.label === '中继：当前规则');
   assert.equal(relay.totals.pings, cfg.auto.count, '中继按每段次数');
-  assert.equal(result.variants.find(v => v.label.startsWith('网关 span=3h')).totals.pings, 3, 'span 也封顶工具调用回合的安排');
+  assert.equal(result.variants.find(v => v.label.startsWith('网关旧规则 span=3h')).totals.pings, 3, 'span 也封顶工具调用回合的安排');
+  assert.equal(result.variants.find(v => v.label.startsWith('网关护栏版 span=3h')).totals.pings, 2, '护栏版工具调用回合最多 2h → 2 次');
+});
+
+test('网关护栏版：提前量 5m（55 分钟一次）、工具调用最多 2 次、停在用户处要人工 ≥2 轮且前缀 ≥100K、静默时段可选、提前量风险按 0 计', () => {
+  assert.equal(gatewayBudget({ spanSec: 0, leadSec: 300, toolCallSpanSec: 2 * 3600 }), 2, '55m、115m 两次，175m 超出 2h');
+  assert.equal(gatewayBudget({ spanSec: 0, leadSec: 300, toolCallSpanSec: 4 * 3600 }), 4);
+  assert.equal(gatewayBudget({ spanSec: 90 * 60, leadSec: 300, toolCallSpanSec: 2 * 3600 }), 1, 'span 更短时按 span');
+  assert.equal(gatewayBudget({ spanSec: 12 * 3600, leadSec: 300 }), 12);
+  const guards = { kind: 'gateway', spanSec: 12 * 3600, guards: true };
+  assert.deepEqual(gatewayPolicy(guards), { guards: true, spanSec: 12 * 3600, leadSec: 300, toolCallSpanSec: 7200, minHumanTurns: 2, minContextTokens: 100000, quietHours: [0, 0] });
+  assert.equal(gatewayPolicy({ kind: 'gateway', spanSec: 0 }).leadSec, 30, '旧规则 30s');
+  assert.equal(gatewayPolicy({ kind: 'gateway', spanSec: 0, guards: true, leadSec: 600 }).leadSec, 600, '显式字段覆盖默认');
+  const now = T0 + 48 * 60 * MIN;
+  const gone = simulateSession(session([call(T0, { stop: 'tool_use' })], { humans: [] }), { cfg, now, policy: guards })[0];
+  assert.equal(gone.decision, 'tool-gap', '工具调用回合不看人工轮次');
+  assert.equal(gone.pings, 2);
+  assert.equal(gone.lateRiskUsd, 0, '5m 提前量超过实测最大延迟 108s');
+  const one = simulateSession(session([call(T0)], { humans: [T0 - MIN] }), { cfg, now, policy: guards })[0];
+  assert.equal(one.decision, 'gw-few-human-turns');
+  assert.equal(one.pings, 0);
+  const small = simulateSession(session([call(T0, { read: 50000 })], { humans: [T0 - 2 * MIN, T0 - MIN] }), { cfg, now, policy: guards })[0];
+  assert.equal(small.decision, 'gw-small-context');
+  const ok = simulateSession(session([call(T0, { read: 300000 })], { humans: [T0 - 2 * MIN, T0 - MIN] }), { cfg, now, policy: guards })[0];
+  assert.equal(ok.decision, 'idle');
+  assert.equal(ok.pings, 12, '12h span → 12 次，每 55 分钟一次');
+  // 2 小时回来：55m、110m 两次，保住
+  const back = simulateSession(session([call(T0, { read: 300000 }), call(T0 + 120 * MIN, { read: 23000, write: 285000 })], { humans: [T0 - 2 * MIN, T0 - MIN] }), { cfg, now, policy: guards })[0];
+  assert.equal(back.pings, 2);
+  assert.equal(back.outcome, 'kept');
+  const night = new Date(2026, 9, 22, 2, 0).getTime();
+  const quiet = { ...guards, quietHours: [1, 8] };
+  assert.equal(simulateSession(session([call(night, { read: 300000 })], { humans: [night - 2 * MIN, night - MIN] }), { cfg, now: night + 10 * 3600 * 1000, policy: quiet })[0].decision, 'gw-quiet-hours');
+  assert.equal(simulateSession(session([call(night, { read: 300000 })], { humans: [night - 2 * MIN, night - MIN] }), { cfg, now: night + 10 * 3600 * 1000, policy: guards })[0].decision, 'idle', '默认不设静默时段');
 });
