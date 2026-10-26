@@ -235,7 +235,7 @@ function renderHeader() {
   $('#relay-line').textContent = `中继 ${health.listen} → 上游 ${health.upstream} · 已运行 ${fmtDuration(health.uptimeSec)} · 内存快照 ${health.snapshots} 个（${fmtTokens(health.snapshotBytes)}B）`;
   const b = health.budget;
   const auto = health.auto || {};
-  $('#pills').replaceChildren(
+  $('#pills').replaceChildren(...[
     h('span', { class: 'pill' }, statusEl({ cls: state.error ? 'critical' : 'good', ico: '●' }, state.error ? '离线' : '在线')),
     health.enabled === false ? h('span', { class: 'pill' }, statusEl({ cls: 'critical', ico: '■' }, '保活已全局关闭')) : null,
     h('span', { class: 'pill' }, statusEl(auto.mode === 'on' ? (auto.cooldownUntil ? { cls: 'warning', ico: '⏸' } : { cls: 'good', ico: '◉' }) : { cls: 'neutral', ico: '■' },
@@ -246,7 +246,7 @@ function renderHeader() {
       const tone = ratio >= 1 ? { cls: 'critical', ico: '■' } : ratio >= 0.8 ? { cls: 'warning', ico: '◆' } : { cls: 'neutral', ico: '◇' };
       return h('span', { class: 'pill', title: '每日心跳额度（全局安全刹车），在「自动保活」卡片里改' }, statusEl(tone, `今日心跳 ${b.pings}/${b.maxPings} 次 · ${fmtUsd(b.usd)}/${fmtUsd(b.maxUsd)}${ratio >= 1 ? ' · 已到顶，心跳暂停到次日' : ''}`));
     })(),
-  );
+  ].filter(Boolean));
   $('#updated').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
 }
 
