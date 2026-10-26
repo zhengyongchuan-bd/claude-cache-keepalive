@@ -83,6 +83,8 @@ function startMock(t, state) {
       else if (route === 'POST keepalive') payload = state.keepaliveResponse || { ok: true, enabled: body?.enabled !== false, stopped: ['p1', 'p2'], unpinned: [SID_A], persisted: true, autoMode: 'on', disabledSessions: 1, pinnedSessions: 0 };
       else if (route === 'POST sessions/pin') payload = state.pinResponse || { ok: true, enabled: body?.enabled !== false, results: [] };
       else if (route === 'GET summary') payload = { days: 7, totals: {} };
+      else if (route === 'GET budget') payload = { ok: true, budget: { pings: 12, usd: 1.5, maxPings: 1000, maxUsd: 50, configFile: '/tmp/ka/config.json' } };
+      else if (route === 'POST budget') payload = state.budgetResponse || { ok: true, persisted: true, budget: { pings: 12, usd: 1.5, maxPings: body?.maxPingsPerDay ?? 1000, maxUsd: body?.maxUsdPerDay ?? 50 } };
       else if (route === 'POST ping') payload = state.pingResponse || { ok: true, sessionId: SID_A, by: 'paseo-agent', result: { outcome: 'hit', usage: { cacheRead: 100000, cacheWrite: 0, output: 0 }, costUsd: 0.03 } };
       else if (route === 'GET episodes') payload = state.episodesResponse || { ok: true, days: 7, episodes: [], totals: { episodes: 0, auto: 0, manual: 0, pings: 0, pingCostUsd: 0, pingCostEstimatedUsd: 0, benefitUsd: 0, netUsd: 0, byOutcome: {} } };
       else payload = { ok: false, error: `unexpected ${route}` };
@@ -613,4 +615,38 @@ test('--agent：按 Paseo 任务 ID 定位，status / pin / unpin / stop / auto 
     const bad = await cli(url, ...args);
     assert.notEqual(bad.code, 0, args.join(' '));
   }
+});
+
+
+test('forever 命令 = pin --forever：发 forever 标志；forever --global / --count / --agent 照常；budget 查看与设置', async t => {
+  const { url, requests } = await startMock(t, {
+    pinResponse: { ok: true, enabled: true, results: [{ ok: true, sessionId: SID_A, pin: { untilAt: null, forever: true, durationSec: null, intervalSec: 3000, idleMaxPings: 60 }, estimate: { maxPings: 60, maxUsd: 7.8, idleMaxPings: 60, perDayPings: 29, perDayUsd: 3.77, pingUsd: 0.13, saveUsd: 4.7, contextTokens: 520000 }, warnings: [] }] },
+  });
+  let result = await cli(url, 'forever', '--agent', '15c60532', '--count', '60');
+  assert.equal(result.code, 0, result.stderr);
+  let body = requests.filter(item => item.path === '/keepalive/api/sessions/pin').at(-1).body;
+  assert.equal(body.forever, true);
+  assert.equal(body.enabled, true);
+  assert.equal(body.agent, '15c60532');
+  assert.equal(body.count, '60');
+  assert.match(result.stdout, /长期保活（没有到期时刻.*每段空闲最多 60 次/);
+  const { url: url2, requests: r2 } = await startMock(t, { pinResponse: { ok: true, global: true, enabled: true, ttl: '1h', summary: { pinned: 2, extended: 0, skipped: 0, filtered: 1 }, results: [] } });
+  result = await cli(url2, 'forever', '--global');
+  assert.equal(result.code, 0, result.stderr);
+  body = r2.find(item => item.path === '/keepalive/api/sessions/pin').body;
+  assert.equal(body.global, true);
+  assert.equal(body.forever, true);
+  assert.match(result.stdout, /全局长期保活（1h）：新设 2 个/);
+  // budget
+  result = await cli(url, 'budget');
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /今日已发 12 次 \/ 1000 次，\$1\.50 \/ \$50\.00（3%）/);
+  result = await cli(url, 'budget', 'set', '--pings', '3000', '--usd', '$120');
+  assert.equal(result.code, 0, result.stderr);
+  body = requests.filter(item => item.path === '/keepalive/api/budget').at(-1).body;
+  assert.equal(body.maxPingsPerDay, 3000);
+  assert.equal(body.maxUsdPerDay, 120);
+  assert.match(result.stdout, /3000 次，\$1\.50 \/ \$120（1%）/);
+  const bad = await cli(url, 'budget', 'set');
+  assert.notEqual(bad.code, 0);
 });

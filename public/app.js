@@ -241,7 +241,11 @@ function renderHeader() {
     h('span', { class: 'pill' }, statusEl(auto.mode === 'on' ? (auto.cooldownUntil ? { cls: 'warning', ico: '⏸' } : { cls: 'good', ico: '◉' }) : { cls: 'neutral', ico: '■' },
       auto.mode === 'on' ? (auto.cooldownUntil ? `自动保活暂停到 ${fmtTime(auto.cooldownUntil)}` : '自动保活 开') : '自动保活 关')),
     h('span', { class: 'pill' }, `进行中计划 ${health.activePlans}${health.autoPlans ? `（自动 ${health.autoPlans}）` : ''}${health.pinnedSessions ? ` · 长保活 ${health.pinnedSessions} 个会话` : ''}`),
-    h('span', { class: 'pill' }, `今日心跳 ${b.pings}/${b.maxPings} 次 · ${fmtUsd(b.usd)}/${fmtUsd(b.maxUsd)}`),
+    (() => {
+      const ratio = Math.max(b.maxPings ? b.pings / b.maxPings : 0, b.maxUsd ? b.usd / b.maxUsd : 0);
+      const tone = ratio >= 1 ? { cls: 'critical', ico: '■' } : ratio >= 0.8 ? { cls: 'warning', ico: '◆' } : { cls: 'neutral', ico: '◇' };
+      return h('span', { class: 'pill', title: '每日心跳额度（全局安全刹车），在「自动保活」卡片里改' }, statusEl(tone, `今日心跳 ${b.pings}/${b.maxPings} 次 · ${fmtUsd(b.usd)}/${fmtUsd(b.maxUsd)}${ratio >= 1 ? ' · 已到顶，心跳暂停到次日' : ''}`));
+    })(),
   );
   $('#updated').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
 }
@@ -329,36 +333,56 @@ ${result.errors.map(error => `· ${error}`).join('\n')}`);
     state.autoSaving = false;
     await refresh();
   };
+  const globalPin = (body, confirmText, label) => async () => {
+    if (confirmText && !window.confirm(confirmText)) return;
+    state.autoSaving = true;
+    try {
+      const result = await api('sessions/pin', { method: 'POST', body: { global: true, source: 'web', ...body } });
+      const s = result.summary || {};
+      toast(body.enabled === false ? `已取消 ${s.unpinned || 0} 个会话的长保活` : `${label}：新设 ${s.pinned || 0} 个，延长 ${s.extended || 0} 个，跳过 ${s.skipped || 0} 个${s.filtered ? `（另有 ${s.filtered} 个不在范围：非主对话 / 非 1h / 缓存已过期）` : ''}`);
+    } catch (error) {
+      toast(`操作失败：${error.message}`);
+    }
+    state.autoSaving = false;
+    await refresh();
+  };
+  const cap = state.health?.defaults?.pin?.idleMaxPings || 30;
+  const b = state.health?.budget || {};
+  const budgetDraft = state.budgetDraft || { pings: b.maxPings, usd: b.maxUsd };
+  const budgetField = (key, label, attrs) => h('label', { class: 'field' }, h('span', { class: 'small muted' }, label),
+    h('input', { type: 'number', value: budgetDraft[key], 'aria-label': label, ...attrs, oninput: event => { state.budgetDraft = { ...(state.budgetDraft || budgetDraft), [key]: event.target.value }; } }));
+  const saveBudget = async () => {
+    const latest = state.budgetDraft || budgetDraft;
+    state.autoSaving = true;
+    try {
+      const result = await api('budget', { method: 'POST', body: { maxPingsPerDay: Number(latest.pings), maxUsdPerDay: Number(latest.usd) } });
+      if (!result.ok) toast(`额度没生效：\n${result.errors.map(error => `· ${error}`).join('\n')}`);
+      else {
+        state.budgetDraft = null;
+        toast(`每日额度已改为 ${result.budget.maxPings} 次 / ${fmtUsd(result.budget.maxUsd)}${result.persisted ? '（已写入配置文件）' : '（只在中继本次运行期间生效）'}`);
+      }
+    } catch (error) {
+      toast(`保存失败：${error.message}`);
+    }
+    state.autoSaving = false;
+    await refresh();
+  };
   host.replaceChildren(
     h('div', { class: 'auto-head' },
+      h('span', { class: 'cell-label' }, '总控'),
       h('span', { class: 'small' }, statusEl(enabled ? { cls: 'good', ico: '●' } : { cls: 'critical', ico: '■' }, enabled ? '保活总开关：开' : '保活总开关：关（不发任何心跳）')),
       h('button', { type: 'button', class: `btn${enabled ? '' : ' primary'}`, disabled: state.autoSaving, title: enabled ? '停掉所有会话的所有保活，并禁止新开' : '重新允许保活', onclick: toggleAll }, enabled ? '全部关闭' : '全部打开'),
       h('span', { class: 'muted small' }, '·'),
-      h('button', { type: 'button', class: 'btn', disabled: state.autoSaving, title: '所有缓存仍有效的 1h 主对话一起长保活 12 小时；人在工作时不发', onclick: async () => {
-        if (!window.confirm('给所有缓存仍有效的 1h 主对话设 12 小时长保活？只在空闲时发心跳。')) return;
-        try {
-          const result = await api('sessions/pin', { method: 'POST', body: { global: true, enabled: true, source: 'web' } });
-          const s = result.summary || {};
-          toast(`全局长保活：新设 ${s.pinned || 0} 个，延长 ${s.extended || 0} 个，跳过 ${s.skipped || 0} 个`);
-        } catch (error) {
-          toast(`操作失败：${error.message}`);
-        }
-        await refresh();
-      } }, '全部长保活 12h'),
-      state.health?.pinnedSessions ? h('button', { type: 'button', class: 'btn', disabled: state.autoSaving, onclick: async () => {
-        try {
-          const result = await api('sessions/pin', { method: 'POST', body: { global: true, enabled: false, source: 'web' } });
-          toast(`已取消 ${result.summary?.unpinned || 0} 个会话的长保活`);
-        } catch (error) {
-          toast(`操作失败：${error.message}`);
-        }
-        await refresh();
-      } }, `取消全部长保活（${state.health.pinnedSessions}）`) : null,
-      h('span', { class: 'muted small' }, '·'),
-      statusEl(on ? { cls: 'good', ico: '◉' } : { cls: 'neutral', ico: '■' }, on ? '自动保活已开启' : '自动保活已关闭'),
+      h('button', { type: 'button', class: 'btn', disabled: state.autoSaving || !enabled, title: '所有缓存仍有效的 1h 主对话一起长保活 12 小时；人在工作时不发', onclick: globalPin({ enabled: true }, '给所有缓存仍有效的 1h 主对话设 12 小时长保活？只在空闲时发心跳。', '全局长保活') }, '全部长保活 12h'),
+      h('button', { type: 'button', class: 'btn', disabled: state.autoSaving || !enabled, title: `所有缓存仍有效的 1h 主对话一起长期保活：没有到期时刻，每段空闲最多 ${cap} 次`, onclick: globalPin({ enabled: true, forever: true }, `给所有缓存仍有效的 1h 主对话设长期保活？没有到期时刻，每段空闲最多 ${cap} 次心跳，直到取消。`, '全局长期保活') }, '全部长期'),
+      state.health?.pinnedSessions ? h('button', { type: 'button', class: 'btn', disabled: state.autoSaving, onclick: globalPin({ enabled: false }, null, '') }, `取消全部长保活（${state.health.pinnedSessions}）`) : null),
+    h('div', { class: 'auto-head' },
+      h('span', { class: 'cell-label' }, '自动保活'),
+      statusEl(on ? { cls: 'good', ico: '◉' } : { cls: 'neutral', ico: '■' }, on ? '已开启' : '已关闭'),
       h('button', { type: 'button', class: `btn${on ? '' : ' primary'}`, disabled: state.autoSaving, onclick: () => save({ mode: on ? 'off' : 'on' }) }, on ? '全局关闭' : '全局开启'),
       auto.cooldownUntil ? h('span', { class: 'small' }, statusEl({ cls: 'warning', ico: '⏸' }, `有自动心跳没命中，暂停到 ${fmtTime(auto.cooldownUntil)}`), ' ',
-        h('button', { type: 'button', class: 'btn', onclick: () => save({ clearCooldown: true }) }, '解除暂停')) : null),
+        h('button', { type: 'button', class: 'btn', onclick: () => save({ clearCooldown: true }) }, '解除暂停')) : null,
+      auto.disabledSessions ? h('span', { class: 'small muted' }, `· ${auto.disabledSessions} 个会话已单独关闭（会话行「恢复自动」）`) : null),
     h('p', { class: 'small rule' }, autoRuleText(auto)),
     h('div', { class: 'auto-form' },
       field('count', '每段空闲最多几次', { min: 1, max: 12 }),
@@ -382,6 +406,12 @@ ${result.errors.map(error => `· ${error}`).join('\n')}`);
           });
         },
       }, '保存设置')),
+    h('div', { class: 'auto-form' },
+      h('span', { class: 'cell-label', style: 'align-self:center' }, '每日额度（全局安全刹车）'),
+      budgetField('pings', '每天最多几次心跳', { min: 1, max: 100000 }),
+      budgetField('usd', '每天最多花（美元）', { min: 0.01, max: 100000, step: 1 }),
+      h('span', { class: 'small muted', style: 'align-self:center' }, `今日已发 ${b.pings ?? 0} 次 ${fmtUsd(b.usd ?? 0)}；任一到顶，所有心跳暂停到次日`),
+      h('button', { type: 'button', class: 'btn', disabled: state.autoSaving, onclick: saveBudget }, '保存额度')),
     h('div', { class: 'auto-stats' },
       h('div', {}, h('div', { class: 'cell-label' }, '本期自动保活'),
         h('div', { class: 'small' }, `开启 ${t.autoStarted || 0} 段空闲 · 心跳 ${a.pings || 0} 次 ${fmtUsd(a.pingCostUsd || 0)}`),
@@ -721,17 +751,18 @@ function actionsCell(view) {
     ? h('button', { type: 'button', class: 'btn', disabled: busy, onclick: setAuto(true) }, '恢复自动')
     : autoState && autoState !== 'off' ? h('button', { type: 'button', class: 'btn', disabled: busy, title: '整个会话不再自动保活', onclick: setAuto(false) }, '关闭自动') : null;
   const cell = h('div', { class: 'actions' },
-    h('div', { class: 'action-row' }, countInput, intervalSelect,
-      h('button', { type: 'button', class: 'btn primary', disabled: busy || !p, onclick: start }, activePlan ? '重新保活' : '保活')),
-    h('div', { class: 'action-row' },
-      h('button', { type: 'button', class: 'btn', disabled: busy || !p, onclick: pingNow }, '立即补一次'),
-      activePlan ? h('button', { type: 'button', class: 'btn', disabled: busy, title: '停止计划，并关闭该会话的自动保活', onclick: stop }, '停止') : null,
-      autoButton,
-      h('label', { class: 'check small', title: '越过软护栏：上下文过小、上次心跳未命中' }, force, '强制')),
     h('div', { class: 'action-row' },
       view.pin
-        ? h('button', { type: 'button', class: 'btn', disabled: busy, title: '取消长保活（进行中的心跳计划一并停止）', onclick: unpin }, '取消长保活')
-        : [pinHours, h('span', { class: 'small muted' }, '小时'), h('button', { type: 'button', class: 'btn', disabled: busy || !p, title: '期间每段空闲都按间隔心跳直到到期；人在工作时不发；未命中即锁定并取消', onclick: pin }, '长保活'), h('button', { type: 'button', class: 'btn', disabled: busy || !p, title: '没有到期时刻，直到取消；每段空闲都心跳到人回来；未命中、任务进程退出、每日额度照常', onclick: pinForever }, '长期')]));
+        ? h('button', { type: 'button', class: 'btn', disabled: busy, title: '取消长保活（进行中的心跳计划一并停止）', onclick: unpin }, view.pin.untilAt == null ? '取消长期保活' : '取消长保活')
+        : [pinHours, h('span', { class: 'small muted' }, '小时'), h('button', { type: 'button', class: 'btn primary', disabled: busy || !p, title: '期间每段空闲都按间隔心跳直到到期；人在工作时不发；未命中即锁定并取消', onclick: pin }, '长保活'), h('button', { type: 'button', class: 'btn', disabled: busy || !p, title: '没有到期时刻，直到取消；每段空闲都心跳到人回来（每段有次数上限）；未命中、任务进程退出、每日额度照常', onclick: pinForever }, '长期')],
+      activePlan ? h('button', { type: 'button', class: 'btn', disabled: busy, title: '停止计划，并关闭该会话的自动保活', onclick: stop }, '停止') : null,
+      autoButton),
+    h('div', { class: 'action-row' },
+      h('span', { class: 'small muted' }, '手动'),
+      countInput, intervalSelect,
+      h('button', { type: 'button', class: 'btn', disabled: busy || !p, title: '固定次数的手动计划；一般用长保活代替', onclick: start }, activePlan ? '重新保活' : '保活 N 次'),
+      h('button', { type: 'button', class: 'btn', disabled: busy || !p, onclick: pingNow }, '立即补一次'),
+      h('label', { class: 'check small', title: '越过软护栏：上下文过小、上次心跳未命中' }, force, '强制')));
   if (check && !check.ok && !activePlan) cell.append(h('ul', { class: 'reasons' }, check.errors.map(error => h('li', {}, `${error.message}${error.soft ? '（可强制）' : ''}`))));
   return cell;
 }
@@ -969,7 +1000,7 @@ function renderBacktest() {
       kpi('心跳', `${t.pings} 次`, `有用 ${t.usefulPings} · 白发 ${t.wastedPings}（${fmtUsd(t.wastedUsd)}）`),
       kpi('ROI', t.roi == null ? '—' : `${t.roi.toFixed(1)}×`, '救回 ÷ 心跳花费'),
       kpi('不保活时的重写', fmtUsd(t.coldUsd), `${t.coldStarts} 次；开了之后仍要重写 ${t.missed} 次 ${fmtUsd(t.missedUsd)}`)),
-    h('p', { class: 'small muted' }, `近 ${r.days} 天 · ${t.sessions} 个 1h 会话 · ${t.idleGaps} 段超过 50 分钟的空闲 · ${bt.data.cached ? `缓存于 ${fmtTime(bt.data.at)}` : `计算于 ${fmtTime(bt.data.at)}`}。心跳按全部命中计。`),
+    h('p', { class: 'small muted' }, `近 ${r.days} 天 · ${t.sessions} 个 1h 会话 · ${t.idleGaps} 段超过 50 分钟的空闲 · ${bt.data.cached ? `缓存于 ${fmtTime(bt.data.at)}` : `计算于 ${fmtTime(bt.data.at)}`}。心跳按全部命中计；历史记录里没有进程状态，回测看不到「任务进程已退出不保活」这条门槛，线上的白发会比这里少。`),
     h('div', { class: 'grid2 tight' },
       h('div', {}, h('div', { class: 'cell-label' }, '每段空闲的结局'),
         h('table', { class: 'data' }, h('tbody', {}, outcomes.map(([key, n]) => h('tr', {}, h('td', {}, labels[key] || key), h('td', { class: 'r' }, `${n} 段`)))))),

@@ -2131,3 +2131,32 @@ test('长期保活每段空闲有次数上限：--count 3 发满即停这段（�
   }
   assert.equal(upstream.requests.length - again, 3, '新段又发 3 次');
 });
+
+
+test('每日额度可改（POST budget）：校验、写入配置文件、health 立即反映；GET budget 返回今日用量', async t => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ka-cfg-'));
+  const configFile = path.join(configDir, 'config.json');
+  fs.writeFileSync(configFile, JSON.stringify({ auto: { count: 4 } }));
+  t.after(() => fs.rmSync(configDir, { recursive: true, force: true }));
+  const { relay } = await setup(t, {}, { watchConfig: { file: configFile, load: () => mergeConfig(DEFAULT_CONFIG, JSON.parse(fs.readFileSync(configFile, 'utf8'))) } });
+  const before = (await control(relay, 'GET', 'budget')).json.budget;
+  assert.equal(before.maxPings, 1000, '默认 1000 次');
+  assert.equal(before.maxUsd, 50, '默认 $50');
+  const bad = await control(relay, 'POST', 'budget', { maxPingsPerDay: 0, maxUsdPerDay: -1 });
+  assert.equal(bad.json.ok, false);
+  assert.equal(bad.json.errors.length, 2);
+  const empty = await control(relay, 'POST', 'budget', {});
+  assert.equal(empty.json.ok, false);
+  const good = await control(relay, 'POST', 'budget', { maxPingsPerDay: 2000, maxUsdPerDay: 80.5 });
+  assert.equal(good.json.ok, true, JSON.stringify(good.json));
+  assert.equal(good.json.persisted, true);
+  assert.equal(good.json.budget.maxPings, 2000);
+  assert.equal(good.json.budget.maxUsd, 80.5);
+  const saved = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  assert.equal(saved.maxPingsPerDay, 2000);
+  assert.equal(saved.maxUsdPerDay, 80.5);
+  assert.deepEqual(saved.auto, { count: 4 }, '其他配置项保留');
+  const health = (await control(relay, 'GET', 'health')).json;
+  assert.equal(health.budget.maxPings, 2000);
+  assert.equal(health.budget.maxUsd, 80.5);
+});

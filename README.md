@@ -89,7 +89,7 @@ cache-keepalive web                     # 页面地址：http://127.0.0.1:18110/
 | `cache-keepalive` | 当前会话：缓存剩余、自动 / 长保活状态与原因、上次心跳、能否保活 |
 | `cache-keepalive list` | 所有会话一览：TTL / 前缀 / 缓存剩余 / 计划 / 自动保活；`--active` 只看有计划的，`--warm` 只看缓存有效的 |
 | `cache-keepalive pin [--for 12h]` | 当前会话**长保活**（默认 12 小时，最长 48）：按时长不按次数，每段空闲每 50 分钟一次直到到期，人在工作时不发 |
-| `cache-keepalive pin --forever` | **长期保活**：没有到期时刻，直到 `unpin` / `stop`；每段空闲都心跳到人回来，人在工作时不发；未命中、任务进程退出、每日额度照常 |
+| `cache-keepalive forever [--count 30]` | **长期保活**（= `pin --forever`）：没有到期时刻，直到 `unpin` / `stop`；每段空闲最多 N 次（默认 30 ≈ 25 小时），满了停到下一次请求；人在工作时不发；未命中、任务进程退出、每日额度照常 |
 | `cache-keepalive pin --global` / `unpin --global` | 所有缓存仍有效的 1h 主对话一起长保活 / 全部取消；`--all-sessions` 连已过期的也设，等它们下次请求后接上 |
 | `cache-keepalive unpin` | 取消当前会话的长保活 |
 | `cache-keepalive stop` | 停掉当前会话的一切保活：计划、长保活，并关闭它的自动保活（`auto on` 恢复） |
@@ -103,7 +103,8 @@ cache-keepalive web                     # 页面地址：http://127.0.0.1:18110/
 |---|---|
 | `auto` | 全局设置 + 当前会话的判定结果 |
 | `auto on` / `auto off` | 打开 / 关闭当前会话的自动保活（`--global` 作用于全局开关；全局关闭时停掉进行中的自动计划，手动与长保活不受影响） |
-| `auto set --count 3 --min-context 100k --min-turns 1 --quiet 1-8 --cooldown 2h --skip-closed on` | 改参数（写入 `config.json`，热加载）；`--clear-cooldown` 解除未命中后的全局暂停 |
+| `budget` / `budget set --pings 1000 --usd 50` | 每日心跳额度：看今日用量 / 改上限（写入 `config.json`） |
+| `auto set --count 3 --min-context 100k --min-turns 2 --quiet 1-8 --cooldown 2h --skip-closed on` | 改参数（写入 `config.json`，热加载）；`--clear-cooldown` 解除未命中后的全局暂停 |
 | `auto reset [--global] [--clear-blocked]` | 清除会话级「已关闭」标记；`--clear-blocked` 同时解除未命中锁定 |
 | `auto status --global` | 各会话自动保活状态汇总 |
 
@@ -174,9 +175,9 @@ cache-keepalive pin                 # 在任务的工作区（或 Paseo 任务�
 cache-keepalive pin --for 24h       # 指定时长；--interval 45m 改间隔；--session 3d7c 指定会话
 cache-keepalive unpin               # 取消；stop 也会取消
 cache-keepalive pin --agent 15c60532  # 按 Paseo 任务 ID（前缀）指定；status / stop / unpin / auto on|off / episodes / ping 同样支持 --agent
-cache-keepalive pin --forever       # 长期：没有到期时刻，直到 unpin / stop
+cache-keepalive forever             # 长期：没有到期时刻，直到 unpin / stop（= pin --forever；--count N 改每段上限）
 cache-keepalive pin --global        # 所有缓存仍有效的 1h 主对话一起 12 小时；--ttl any 不限 TTL，--all-sessions 连过期的也设
-cache-keepalive pin --global --forever   # 所有正在跑的 1h 会话长期保活
+cache-keepalive forever --global    # 所有正在跑的 1h 会话长期保活
 cache-keepalive unpin --global      # 全部取消
 ```
 
@@ -185,7 +186,7 @@ cache-keepalive unpin --global      # 全部取消
 **长期保活（`--forever`）** 没有到期时刻、不受 `pin.maxSec` 限制，直到：`unpin` / `stop` / `off`，或护栏停掉它（心跳未命中、心跳有输出、任务归档）。
 「长期」不等于无限发心跳，上限在每段空闲上：**每段空闲最多 `pin.idleMaxPings` 次（默认 30 次 ≈ 25 小时）**，`pin --forever --count N` 按会话改。
 发满了这段停（事件「本段空闲已发满上限」，计划显示 `30/30`），长保活本身还在，下一次真实请求后新的空闲段重新计数；人提前回来这段就提前结束。
-单段成本上界 = 上限 × 单次读取费（520K 的 Opus 会话 30 次约 $3.9），`pin --forever` 会打印；每日额度（200 次 / $10）仍是全局硬上限。
+单段成本上界 = 上限 × 单次读取费（520K 的 Opus 会话 30 次约 $3.9），`forever` 会打印；每日额度（默认 1000 次 / $50，`budget set` 可改）仍是全局硬上限。
 
 **任务一继续，这段保活立刻结束。** 会话每次真实请求都会结束它进行中的自动 / 长保活计划（事件写「会话继续了，本段空闲的长保活结束」），请求在途或客户端重试宽限期内也不发；所以保活次数只取决于这段空闲有多长，不会在任务推进时「多发」。
 
@@ -208,7 +209,7 @@ cache-keepalive unpin --global      # 全部取消
 | 1h 缓存的主对话 | 子代理（带 `x-claude-code-agent-id`）、旁路请求、5m 缓存都不参与；请求标了 1h、上游却按 5m 写入时不参与 |
 | 每段空闲最多 3 次 × 50m | 约覆盖 3.5 小时的离开；回测里 3 次净收益最高 |
 | 缓存前缀 ≥ 100K tokens | 太小的会话省下的钱少 |
-| 人工接入 ≥ 1 轮 | 没有人参与的自动化任务不保活；**停在 `tool_use`（工具、子代理、后台任务执行中）的空闲不看这一条**，它一定会有下一次请求（Paseo 显示任务已关闭时除外） |
+| 人工接入 ≥ 2 轮 | 没有人参与的自动化任务、「发完第一条提示就走」的会话不保活；**停在 `tool_use`（工具、子代理、后台任务执行中）的空闲不看这一条**，它一定会有下一次请求（任务已关闭时除外）。30 天回测（1007 个会话、1042 段空闲）：≥1 轮发 815 次心跳 98% 白发、净 $22；≥2 轮发 195 次、少救 3 次（$2.4）、净 $35 |
 | 1–8 点开始的空闲不保活 | 多半是去睡了，3.5 小时也保不住；熬夜到 1 点前离开的照常保活 |
 | 任务进程已退出 | 这段空闲没人会回来；线上 7 天里「保活后没回来」13 段对「生效」10 段，没回来是最大的成本来源。判断方式见下；`auto set --skip-closed off` 关闭 |
 | 中继错过判定窗口 | 空闲 50–58 分钟之间中继没运行（重启、停机）：缓存多半已过期，不发心跳，记为「错过判定窗口」，页面/CLI 不再显示「已就绪」 |
@@ -253,7 +254,7 @@ cache-keepalive unpin --global      # 全部取消
 | 改配置 | `config.json` 热加载（端口 / 上游除外），不用重启 |
 | 中继不可用 | 路由启动任务时探测不到中继就直连 8080；中继恢复后下一次启动写回中继地址，运行中的会话随 settings.json 热切换 |
 | 次数 / 间隔越界 | 1h：1–12 次、5m–55m；5m：1–10 次、1m–4m30s；超出按边界执行并提示 |
-| 全局 | 每日最多 200 次 / $10，按每次心跳的预估花费预留（多个会话同时到点也不会一起越过上限）；计划最长 24 小时 |
+| 全局 | 每日最多 1000 次 / $50（`cache-keepalive budget set --pings N --usd X` 或页面改），按每次心跳的预估花费预留（多个会话同时到点也不会一起越过上限）；任一到顶所有心跳暂停到次日；计划最长 24 小时 |
 | 真实请求失败（429/5xx/断开） | 客户端会立刻重试：之后 90s 内会话算活跃，不发心跳（`requestRetryGraceSec`） |
 | 全局开始 / 停止 | `start --global` 逐会话跑同一套护栏，跳过原因汇总输出，不会因为某个会话失败而中断；`stop --global` 停全部计划并关闭全部当前会话的自动保活；`auto off --global` 只停自动计划 |
 | 心跳有输出（上游没遵守 `max_tokens`） | 超过 16 个输出 token 就停发：每次心跳会按输出价（和思考）计费；该会话不再自动保活，手动需强制 |

@@ -258,7 +258,7 @@ test('evaluatePlanRequest：硬护栏', () => {
   assert.deepEqual(codes({ cacheable: false, expectedCached: 0 }).sort(), ['not-cacheable', 'small-context']);
   assert.deepEqual(codes({ unpingableReason: 'thinking-enabled' }), ['thinking-enabled']);
   assert.deepEqual(codes({ ttl: null }), ['no-cache-control']);
-  const budget = evaluatePlanRequest({ lineage: guardLineage(), now: NOW, daily: { pings: 200, usd: 1 } });
+  const budget = evaluatePlanRequest({ lineage: guardLineage(), now: NOW, daily: { pings: 1000, usd: 1 } });
   assert.deepEqual(budget.errors.map(error => error.code), ['daily-budget']);
   // 强制也不能越过硬护栏
   assert.equal(evaluatePlanRequest({ lineage: guardLineage({ lastTouchAt: NOW - 2 * 3600 * 1000 }), force: true, now: NOW }).ok, false);

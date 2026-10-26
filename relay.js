@@ -397,6 +397,10 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
         return sendJson(res, 200, { ok: true, auto: autoSettings(), labels: AUTO_SKIP_LABELS });
       case 'POST auto':
         return sendJson(res, 200, updateAuto(input));
+      case 'GET budget':
+        return sendJson(res, 200, { ok: true, budget: budgetView() });
+      case 'POST budget':
+        return sendJson(res, 200, updateBudget(input));
       case 'POST sessions/auto':
         return sendJson(res, 200, setSessionAuto(input));
       case 'POST sessions/pin':
@@ -653,6 +657,32 @@ export function createRelay({ cfg, stateDir = null, now = () => Date.now(), log 
       // 会话级「已关闭自动保活」的数量，CLI/页面用来提示如何恢复
       disabledSessions: [...store.sessions.values()].filter(session => session.autoDisabled).length,
     };
+  }
+
+  function budgetView() {
+    return { ...store.dailyUsage(), maxPings: cfg.maxPingsPerDay, maxUsd: cfg.maxUsdPerDay, configFile: watchConfig?.file || null };
+  }
+
+  // 改每日额度（全局安全刹车）：写进内存并写回 config.json
+  function updateBudget(input) {
+    const patch = {};
+    const errors = [];
+    if (input.maxPingsPerDay !== undefined) {
+      const value = Number(input.maxPingsPerDay);
+      if (!Number.isInteger(value) || value < 1 || value > 100000) errors.push('maxPingsPerDay 需要是 1–100000 的整数');
+      else patch.maxPingsPerDay = value;
+    }
+    if (input.maxUsdPerDay !== undefined) {
+      const value = Number(input.maxUsdPerDay);
+      if (!Number.isFinite(value) || value <= 0 || value > 100000) errors.push('maxUsdPerDay 需要是 0–100000 之间的数');
+      else patch.maxUsdPerDay = Math.round(value * 100) / 100;
+    }
+    if (errors.length) return { ok: false, errors };
+    if (!Object.keys(patch).length) return { ok: false, errors: ['需要 maxPingsPerDay 或 maxUsdPerDay'] };
+    Object.assign(cfg, patch);
+    const persisted = persistConfig(current => Object.assign(current, patch));
+    log(`budget ${JSON.stringify(patch)}${persisted ? ' (已写入配置文件)' : ''}`);
+    return { ok: true, budget: budgetView(), persisted };
   }
 
   // 改全局自动保活设置：校验后写进内存，并写回 config.json（保留其他配置项；热加载会读到同样的值）

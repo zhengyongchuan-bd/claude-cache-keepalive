@@ -336,3 +336,5 @@ button.ghost.small { font-size: 12px; margin-top: 8px; }
   .auto-stats { grid-template-columns: 1fr; }
   .field input { width: 100px; }
 }
+.auto-head + .auto-head { margin-top: 6px; }
+.auto-head .cell-label { min-width: 56px; }

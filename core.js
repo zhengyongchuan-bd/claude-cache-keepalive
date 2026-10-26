@@ -21,8 +21,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   maxPingWriteTokens: 4096,
   maxPingWriteRatio: 0.01,
   resumeHitRatio: 0.8,       // 回来的请求 cache_read ≥ 最后一次命中心跳读到的 × 该比例才算「保住」（低于它多半只读到共享系统前缀）
-  maxPingsPerDay: 200,       // 全局安全刹车（按本地日期）
-  maxUsdPerDay: 10,
+  // 全局安全刹车（按本地日期）：任务多时一天的心跳不止几百次（30 个会话 × 每天约 29 次），按金额兜底更实在；
+  // cache-keepalive budget set --pings N --usd X 可改
+  maxPingsPerDay: 1000,
+  maxUsdPerDay: 50,
   planMaxAgeSec: 86400,
   // 实测 58 次心跳 p50 5.6s / p90 16.6s / p99 94s / max 108s（2026-10-25）：120s 会被长上下文撞到。
   // 超时的心跳上游多半已经处理（照常计费、照常刷新缓存），所以按预估成本记账并计入每日额度
@@ -59,7 +61,9 @@ export const DEFAULT_CONFIG = Object.freeze({
     mode: 'on',               // on / off
     count: 3,                 // 每段空闲最多几次心跳（3 × 50m 约覆盖 3.5 小时的离开）
     minContextTokens: 100000, // 缓存前缀太小的会话不自动保活
-    minHumanTurns: 1,         // 人工接入轮次太少（没有人参与的自动化任务）不自动保活；回测里 ≥2 会漏掉「发完第一条提示就离开」的会话
+    // 人工接入轮次太少（没有人参与的自动化任务）不自动保活。30 天回测（1007 个会话）：≥1 轮 815 次心跳 98% 白发、净 $22；
+    // ≥2 轮 195 次心跳、少救 3 次（$2.4）、净 $35——「发完第一条提示就走」的会话绝大多数不会再回来
+    minHumanTurns: 2,
     toolGapIgnoresTurns: true, // 工具（含子代理、后台任务）执行中的空闲一定会有下一次请求，不看人工轮次
     quietHours: [1, 8],       // 本地时间 [1 点, 8 点) 开始的空闲不自动保活（多半是去睡了，3.5 小时也保不住）；[0, 0] 关闭
     missCooldownSec: 7200,    // 任一自动心跳没命中后，全局暂停新的自动保活这么久

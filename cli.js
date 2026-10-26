@@ -24,17 +24,19 @@ const HELP = `用法: cache-keepalive [命令] [选项]      在任务的工作�
   status (默认)         当前会话：缓存剩余、自动/长保活状态、上次心跳、能否保活
   list                  所有会话一览：TTL / 前缀 / 缓存剩余 / 计划 / 自动保活（--active 只看有计划的，--warm 只看缓存有效的）
   pin [--for 12h]       当前会话长保活（默认 12h，最长 48h）：每段空闲都心跳到到期，人在工作时不发；按时长不按次数
-  pin --forever [--count 30]  长期保活：没有到期时刻，直到 unpin / stop；每段空闲最多 N 次（默认 30 ≈ 25h），满了停到下一次请求
-  unpin                 取消当前会话的长保活
+  forever [--count 30]  当前会话长期保活：没有到期时刻，直到 unpin / stop；每段空闲最多 N 次（默认 30 ≈ 25h），满了停到下一次请求
+  unpin                 取消当前会话的长保活 / 长期保活
   pin --global [...]    所有缓存仍有效的 1h 主对话一起长保活（--ttl 5m|any；--all-sessions 连已过期的也设，等它们下次请求后接上）
+  forever --global      所有缓存仍有效的 1h 主对话一起长期保活
   unpin --global        取消所有会话的长保活
   stop                  停掉当前会话的一切保活：计划、长保活，并关闭它的自动保活（auto on 恢复）
   off / on              总开关：off 停掉所有会话的所有保活（自动/手动/长保活）且不能再开；on 打开
 
-自动保活（默认开：1h 主对话空闲 50m 自动心跳，每段最多 3 次）:
+自动保活（默认开：1h 主对话空闲 50m 自动心跳，每段最多 3 次；前缀 ≥100K、人工 ≥2 轮、凌晨不开）:
   auto                  全局设置 + 当前会话的判定结果
   auto on | off         打开 / 关闭当前会话的自动保活（--global 作用于全局开关）
   auto set ...          --count N --min-context 100k --min-turns N --quiet 1-8|off --cooldown 2h --skip-closed on|off --clear-cooldown
+  budget [set --pings N --usd X]  每日心跳额度（全局安全刹车，默认 1000 次 / $50）：看今日用量 / 改上限
   auto reset [--global] 清除会话级「已关闭」标记（--clear-blocked 同时解除未命中锁定）
   auto status --global  各会话自动保活状态汇总
 
@@ -73,7 +75,9 @@ const HELP = `用法: cache-keepalive [命令] [选项]      在任务的工作�
   cache-keepalive pin --for 24h --session 3d7c
   cache-keepalive pin --agent 15c60532          # 按 Paseo 任务 ID 指定；status / stop / unpin / auto / episodes 同样可用 --agent
   cache-keepalive pin --global                  # 所有正在跑的 1h 会话长保活 12 小时
-  cache-keepalive pin --forever                 # 当前会话长期保活，直到 unpin
+  cache-keepalive forever                       # 当前会话长期保活，直到 unpin（= pin --forever）
+  cache-keepalive forever --agent 15c60532 --count 60   # 指定任务，每段空闲最多 60 次
+  cache-keepalive budget set --usd 100          # 放宽每日金额上限
   cache-keepalive stop                 # 当前任务全停
   cache-keepalive off --reason 下班     # 全部停、不再发；明天 cache-keepalive on
   cache-keepalive list --active        # 谁在保活
@@ -103,6 +107,8 @@ function parseArgs(argv) {
     else if (value === '--ttl') opts.ttl = next();
     else if (value === '--for' || value === '--duration') opts.for = next();
     else if (value === '--hours') opts.hours = next();
+    else if (value === '--pings') opts.pings = next();
+    else if (value === '--usd') opts.usd = next();
     else if (value === '--active') opts.active = true;
     else if (value === '--warm') opts.warm = true;
     else if (value === '--limit') opts.limit = next();
@@ -727,6 +733,34 @@ async function autoCommand(opts, out) {
   throw new Error(`未知的 auto 子命令: ${action}（status / on / off / set / reset）`);
 }
 
+async function budgetCommand(opts, out) {
+  const action = opts.positional[0] || 'show';
+  if (action === 'set') {
+    const body = {};
+    if (opts.pings != null) body.maxPingsPerDay = Number(opts.pings);
+    if (opts.usd != null) body.maxUsdPerDay = Number(String(opts.usd).replace(/^\$/, ''));
+    if (!Object.keys(body).length) throw new Error('budget set 需要 --pings N 和/或 --usd X');
+    const result = await api(opts, 'POST', 'budget', body);
+    if (opts.json) return out(result);
+    if (!result.ok) throw new Error(result.errors.join('；'));
+    printBudget(result.budget);
+    if (!result.persisted) console.log('  ! 没写进配置文件，只在中继这次运行期间生效');
+    return undefined;
+  }
+  if (action !== 'show') throw new Error(`未知的 budget 子命令: ${action}（show / set）`);
+  const result = await api(opts, 'GET', 'budget');
+  if (opts.json) return out(result);
+  printBudget(result.budget);
+  return undefined;
+}
+
+function printBudget(b) {
+  const pct = b.maxUsd ? Math.round((b.usd / b.maxUsd) * 100) : 0;
+  console.log(`每日心跳额度：今日已发 ${b.pings} 次 / ${b.maxPings} 次，${fmtUsd(b.usd)} / ${fmtUsd(b.maxUsd)}（${pct}%）${b.reservedPings ? ` · 进行中预留 ${b.reservedPings} 次 ${fmtUsd(b.reservedUsd || 0)}` : ''}`);
+  console.log('  两项任一到顶，所有会话的心跳暂停到次日；按本地日期。改上限：cache-keepalive budget set --pings N --usd X');
+  if (b.configFile) console.log(`  配置文件 ${b.configFile}`);
+}
+
 function parseDurationArg(value) {
   const m = String(value).trim().toLowerCase().match(/^(\d+)(h|m|s)?$/);
   if (!m) throw new Error(`无法解析时长: ${value}（例如 2h、30m）`);
@@ -829,7 +863,13 @@ async function main() {
   const argv = process.argv.slice(2);
   if (argv[0] === 'serve') return serve(argv.slice(1));
   const opts = parseArgs(argv);
+  // forever = pin --forever（长期保活），其余选项相同
+  if (opts.command === 'forever') {
+    opts.command = 'pin';
+    opts.forever = true;
+  }
   const command = opts.command || 'status';
+  if (command === 'budget') return budgetCommand(opts, out);
   if (opts.help || command === 'help') {
     console.log(HELP);
     return undefined;
